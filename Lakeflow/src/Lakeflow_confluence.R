@@ -121,7 +121,7 @@ ao = median(outputs$ao)
 ##################################################################################
 ##Place data in the netcdf file and write it to outputs folder. 
 ##################################################################################
-id_def = ncdim_def("lake_id", "id", lake_id)
+id_def = ncdim_def("lake_id", "ID", lake_id)
 dimNi <- ncdim_def(name='ni',units = "s/[m1/3]", vals=ni )
 dimNo <- ncdim_def(name='no',units = "s/[m1/3]", vals=no )
 dimAi <- ncdim_def(name='ai',units = "m2", vals=ai )
@@ -139,9 +139,6 @@ ncvar_put(con, varNo, no)
 ncvar_put(con, varAi, ai)
 ncvar_put(con, varAo, ao)
 nc_close(con)
-
-nc = nc_open(paste0(wd, "/outputs/output.nc"))
-id = ncvar_get(nc, "lake_id")
 
 
 
