@@ -9,6 +9,17 @@ source("Path/to/LakeFlow/input_data.R")
 source("Path/to/LakeFlow/LakeFlow_function.R")
 source("Path/to/LakeFlow/output_data.R")
 
+########################################################################################################
+##Inputs. 
+########################################################################################################
+
+##sos = "Path/to/unconstrained/0000/na_sword_v11_SOS.nc"
+##data_dir = "Path/to/sample/netcdf/"
+##lake_id = "7720003433"
+##lake_reach_file = "Path/to/Lake_Database_sample.json"
+##et = "Path/to/et.csv"
+##lateralQ = "Path/to/lateralQ.csv"
+##path = "output_path"
 
 get_data = function(lake_id,lake_reach_file, data_dir,sos,et, lateralQ, output_dir){
   
