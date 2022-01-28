@@ -5,10 +5,11 @@
 #########################################################################################################
 ##Reading in, runnning LakeFlow, and exporting data. 
 #########################################################################################################
-source("E:/research/RivLake/src/Confluence/LakeFlow/input_data.R")
-source("E:/research/RivLake/src/Confluence/LakeFlow/LakeFlow_function.R")
-source("E:/research/RivLake/src/Confluence/LakeFlow/output_data.R")
-  
+source("Path/to/LakeFlow/input_data.R")
+source("Path/to/LakeFlow/LakeFlow_function.R")
+source("Path/to/LakeFlow/output_data.R")
+
+
 get_data = function(lake_id,lake_reach_file, data_dir,sos,et, lateralQ, output_dir){
   
 ##Get input data and priors from geobam. 
