@@ -19,7 +19,7 @@ source("Path/to/LakeFlow/output_data.R")
 ##lake_reach_file = "Path/to/Lake_Database_sample.json"
 ##et = "Path/to/et.csv"
 ##lateralQ = "Path/to/lateralQ.csv"
-##path = "output_path"
+##output_dir = "output_path"
 
 get_data = function(lake_id,lake_reach_file, data_dir,sos,et, lateralQ, output_dir){
   
