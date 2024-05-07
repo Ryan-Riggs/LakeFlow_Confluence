@@ -1,13 +1,18 @@
 library(httr)
+library(data.table)
 
-reach = '710825777'
-pass_start_date = '20231215'
+reaches = c('710825777', '710722628')
+pass_start_date = '20240401'
 
 download_tributary = function(reach_id){
   url = 'https://geoglows.ecmwf.int/api/v2/retrospective/'
   website = paste0(url, reach_id, '?format=csv&start_date=', pass_start_date)
   data=content(GET(website))
-  return(data)
+  return(data.table(data))
 }
 
-testing = download_tributary(reach)
+tributary_flow = lapply(reaches, download_tributary)
+
+tributary_flow_merge = Reduce(function(...) merge(..., all = TRUE), tributary_flow)
+
+tributary_aggregated = tributary_flow_merge[,tributary_total:=rowSums(.SD), .SDcols=-1]
