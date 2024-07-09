@@ -1,7 +1,7 @@
 ##LakeFlow code for running locally
 ##By: Ryan Riggs and George Allen, June 2024.
 
-# *TODO: Test to see if all the DAWG flags help improve performance. 
+# *TODO: Fix the NRT pull for prior Q data of sword reaches using geoglows. 
 ################################################################################
 # set Path to Lakeflow_local folder. 
 ################################################################################
@@ -26,8 +26,8 @@ library(reticulate)
 ################################################################################
 updated_pld = fread(paste0(inPath,"in/SWORDv16_PLDv103.csv"))
 updated_pld$lake_id =  as.character(updated_pld$lake_id)
-reservoirs = data.table::fread(paste0(inPath,'in/', 'filtered_res_61024_static_widths.csv'))
 lakeData = fread(paste0(inPath, '/in/swot_lake_data.csv'))
+gaged_lakes = fread('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/lakeflow_lakes_w_usgs_gage.csv')
 
 # Below is for me so that I can easily add new swot observations to the folder. 
 #swot_path = list.files(paste0(inPath, 'in/data_downloads/'), pattern='.dbf', full.names=TRUE)
@@ -36,7 +36,7 @@ swot_path = list.files('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/src/data_do
 
 open_and_filter = function(f){
   file = foreign::read.dbf(f)
-  file_sub = file#[file$lake_id%in%reservoirs$lake_id,]
+  file_sub = file[file$lake_id%in%gaged_lakes$lake_id,]
   return(file_sub)
 }
 
@@ -44,7 +44,9 @@ files_filt = lapply(swot_path, open_and_filter)
 combined = data.table::rbindlist(files_filt)
 
 ##Filter to non flagged lake obs.
-lakeData = combined[combined$quality_f=='0'&combined$partial_f=='0',]
+#lakeData = combined[combined$quality_f=='0'&combined$partial_f=='0',]
+# Filter to match DAWG filter. 
+lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2&combined$partial_f==0,]
 lakeData = lakeData%>%distinct(.keep_all=TRUE)
 lakeData$lake_id = as.character(lakeData$lake_id)
 
@@ -53,7 +55,7 @@ lakeData$lake_id_first = sub(";.*", "", lakeData$lake_id)
 lakeData$lake_id=lakeData$lake_id_first
 
 ################################################################################
-# Function to pull reach data. 
+# Function to pull SWOT reach data. 
 ################################################################################
 pull_data = function(feature_id){
   website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f')
@@ -66,9 +68,10 @@ pull_data = function(feature_id){
 # Function to filter SWOT reach data. 
 ################################################################################
 filter_function = function(swot_ts){
-  dawg_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2,]
+  dawg_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0,]
   qual_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$reach_q<=2,]
-  return(qual_filter)
+  #return(qual_filter)
+  return(dawg_filter)
 }
 ################################################################################
 # Function to pull tributary inflow Q estimates. 
@@ -84,17 +87,33 @@ download_tributary = function(reaches){
   return(tributary_aggregated)
 }
 ################################################################################
+# Function to pull geoglows data for prior purposes
+################################################################################
+pull_geoglows = function(reaches){
+  source_python(paste0(inPath, 'src/geoglows_aws_pull.py'))
+  model_flow = pull_tributary(reach_id = reaches)
+  model_flow$Date = as.Date(row.names(model_flow))
+  return(data.table(model_flow))
+}
+################################################################################
 # LakeFlow algorithm. 
 ################################################################################
 lakeFlow = function(lake){
+  
+  # Use dynamic prior Q. 
+  use_ts_prior=TRUE
+  
+  
   #Pull in SWOT river data and subset predownloaded SWOT lake data. 
   upID = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id==lake], ','))
   dnID = unlist(strsplit(updated_pld$D_reach_id[updated_pld$lake_id==lake], ','))
-  upObs_all = rbindlist(lapply(upID, pull_data))
+  upObs_all = try(rbindlist(lapply(upID, pull_data)), silent=TRUE)
+  if(is.error(upObs_all)){return(NA)}
   upObs_all = filter_function(upObs_all)
   #upObs_all = upObs_all[upObs_all$time!='no_data'&upObs_all$reach_q<=2,]
   upObs_all$time=as_datetime(upObs_all$time_str)
-  dnObs_all= rbindlist(lapply(dnID, pull_data))
+  dnObs_all= try(rbindlist(lapply(dnID, pull_data)), silent=TRUE)
+  if(is.error(dnObs_all)){return(NA)}
   #dnObs_all = dnObs_all[dnObs_all$time!='no_data'&dnObs_all$reach_q<=2,]
   dnObs_all = filter_function(dnObs_all)
   dnObs_all$time = as_datetime(dnObs_all$time_str)
@@ -158,10 +177,26 @@ lakeFlow = function(lake){
   dnObs$d_x_area = dnObs[,d_x_area(wse, width), by=reach_id]$V1
   
   # Calculate lake storage and storage change
-  lake_wse_from_min = lakeObs$wse - min(lakeObs$wse)
-  area_m2 = lakeObs$area_total * 1e6 # convert from km2 to m2
-  lakeObs$storage = area_m2 * lake_wse_from_min
-  lakeObs$storage_dt = c(NA, diff(lakeObs$storage))
+   lake_wse_from_min = lakeObs$wse - min(lakeObs$wse)
+   area_m2 = lakeObs$area_total * 1e6 # convert from km2 to m2
+   lakeObs$storage = area_m2 * lake_wse_from_min
+  # lakeObs$storage_dt = c(NA, diff(lakeObs$storage))
+  ht_change = c(NA, diff(lakeObs$wse))
+  area_m2 = lakeObs$area_total*1e6
+
+  area_val = list()
+  for(k in 2:length(area_m2)){
+    current = area_m2[k]
+    prior = area_m2[k-1]
+    area_add = current+prior
+    area_mult= current*prior
+    area_sqrt = sqrt(area_mult)
+    area_val[[k]] = area_add+area_sqrt
+  }
+  area_param = c(NA, unlist(area_val))
+  lakeObs$storage_dt = (ht_change*area_param)/3
+  
+  
   
   # Put data into table matching LakeFlow code (synthetic dataset): 
   lakeObsOut = lakeObs
@@ -291,9 +326,11 @@ lakeFlow = function(lake){
   
   # Pull priors from sos
   up_sos = lapply(upID, sos_pull)
+  if(any(unlist(lapply(up_sos, nrow))==0)){return(NA)}
   up_sos = lapply(up_sos, nms_paste, 'u')
   
   dn_sos = lapply(dnID, sos_pull)
+  if(any(unlist(lapply(dn_sos, nrow))==0)){return(NA)}
   dn_sos = lapply(dn_sos, nms_paste, 'd')
   
   # Transpose the sos data to get in proper format for stan. 
@@ -330,6 +367,54 @@ lakeFlow = function(lake){
   dn_sos_stan$qSd_d = convert_to_matrix(dn_sos_stan$qSd_d)
   up_sos_stan$qHat_u = convert_to_matrix(up_sos_stan$qHat_u)
   dn_sos_stan$qHat_d = convert_to_matrix(dn_sos_stan$qHat_d)
+  
+  if(length(up_sos_stan$reach_id_u)==0){return(NA)}
+  if(length(dn_sos_stan$reach_id_d)==0){return(NA)}
+  
+  
+  # Pull in Modeled timeseries as prior Q rather than mean. 
+  if(use_ts_prior==TRUE){
+    sword_geoglows = fread(paste0(inPath, '/in/ancillary/sword_geoglows.csv'))
+    sword_reaches = c(upID, dnID)
+    sword_geoglows_filt = sword_geoglows[sword_geoglows$reach_id%in%sword_reaches,c('reach_id','LINKNO')]
+    geoglows_reaches = unique(as.list(sword_geoglows$LINKNO[sword_geoglows$reach_id%in%sword_reaches]))
+    # Pull in modeled geoglows data. 
+    model_data = pull_geoglows(geoglows_reaches)
+    # Convert bad Q to NA. 
+    ind = ncol(model_data)-1
+    model_data[,1:ind][model_data[,1:ind] < 0] <- 0
+    # When model data is unavailable (NRT SWOT data), use mean model. 
+    missing_dates = data.table(Date=seq.Date((max(model_data$Date)+1), Sys.Date(), by=1))
+    model_data = bind_rows(model_data, missing_dates)
+    model_data[] <- lapply(model_data, function(x) { 
+      x[is.na(x)] <- mean(x, na.rm = TRUE)
+      x
+    })
+    model_data = model_data[model_data$Date%in%lakeObsOut$date_l,]
+    model_wide = melt(model_data, id.vars=c('Date'))
+    model_wide$LINKNO = as.character(model_wide$variable)
+    model_wide$reach_id = sword_geoglows_filt$reach_id[match(model_wide$LINKNO, sword_geoglows_filt$LINKNO)]
+    model_list = split(model_wide, by='reach_id')
+    
+    up_ind = lapply(up_sos_stan$reach_id_u,function(x){which(as.character(x)==names(model_list))})
+    dn_ind = lapply(dn_sos_stan$reach_id_d,function(x){which(as.character(x)==names(model_list))})
+    
+    if(length(unique(model_wide$LINKNO))==1){
+      up_ind[[1]] = 1
+      dn_ind[[1]] = 1
+    }
+    
+    up_qhat = lapply(unlist(up_ind), function(x){t(as.matrix(model_list[[x]]$value))})
+    up_qhat = do.call(rbind, up_qhat)
+    
+    dn_qhat = lapply(unlist(dn_ind), function(x){t(as.matrix(model_list[[x]]$value))})
+    dn_qhat = do.call(rbind, dn_qhat)
+    
+    up_sos_stan$qHat_u = up_qhat
+    dn_sos_stan$qHat_d = dn_qhat
+  }
+  
+  
   
   # Combine all data needed for stan. 
   stan_data = list(N = nrow(lakeObsOut),
@@ -457,7 +542,7 @@ lakeFlow = function(lake){
 # Filter to lakes with at least n observations. 
 n = 5
 lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
-lakes = lakes#[lakes%in%reservoirs$lake_id]
+lakes = lakes[lakes%in%gaged_lakes$lake_id]
 
 # Apply LakeFlow at the first three lakes. 
 #John Redmond '7420130653'
@@ -472,70 +557,29 @@ index=which(lakes==id_subset)
 lf_results = lapply(lakes[index], lakeFlow)
 lf_outputs = rbindlist(lf_results[!is.na(lf_results)])
 
-# lf_results = lapply(lakes, lakeFlow)
-# output_files = list.files(paste0(inPath, '/out/lf_results/'), full.names=TRUE)
-# lf_outputs = rbindlist(lapply(output_files, fread))
-# lf_outputs$Date = as.Date(lf_outputs$Date)
-# lf_outputs$reach_id = as.character(lf_outputs$reach_id)
-# lf_outputs$lake_id=as.character(lf_outputs$lake_id)
+lf_results = lapply(lakes[1:5], lakeFlow)
+output_files = list.files(paste0(inPath, '/out/lf_results/'), full.names=TRUE)
+lf_outputs = rbindlist(lapply(output_files, fread),fill=TRUE)
+lf_outputs$Date = as.Date(lf_outputs$Date)
+lf_outputs$reach_id = as.character(lf_outputs$reach_id)
+lf_outputs$lake_id=as.character(lf_outputs$lake_id)
+
+
+#rd = sample(length(lakes), 3)
+ryan = list()
+for(i in 119:length(lakes)){
+  print(i)
+  ryan[[i]] = lakeFlow(lakes[i])
+}
+lf_outputs = rbindlist(ryan[!is.na(ryan)])
+lf_outputs = lf_outputs[!is.na(lf_outputs$q_lakeflow),]
 
 #fwrite(lf_outputs,paste0(inPath, '/out/lf_results.csv'))
 ################################################################################
 # Validate lakeflow observations with USGS data.  
 ################################################################################
-# Auto assign gages to reaches.  
-library(dataRetrieval)
-pull_geom = function(feature, feature_id){
-  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=', feature, '&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,geometry')
-  response = GET(website)
-  pull = content(response, as='parsed')$results
-  data = read.csv(textConnection(pull$csv), sep=',')
-  #data$time_str = as.Date(data$time_str)
-  return(data)
-}
-
-geom_function = function(f){
-  geom=pull_geom('Reach', f)[1,]
-  line = st_as_sf(geom, wkt='geometry')
-  return(line)
-}
-reaches = as.character(unique(lf_outputs$reach_id))
-reach_geometries_list = lapply(reaches, geom_function)
-reach_geometries = rbindlist(reach_geometries_list)
-reach_geometries = st_as_sf(reach_geometries)
-st_crs(reach_geometries) = 4326
-
-# Gages in relevant states where there is a lakeflow reach. 
-library(tigris)
-states=states()
-states_filt = st_join(reach_geometries%>%st_transform(crs(states)), states, st_within)
-st = na.omit(unique(states_filt$STUSPS))
-
-# Find gages in relevant states that have discharge data. 
-state_list = list()
-for(i in 1:length(st)){
-  stations = whatNWISsites(stateCd=st[i],parameterCd='00060',hasDataTypeCd='iv')
-  state_list[[i]] = stations
-}
-usgs = rbindlist(state_list)
-
-# Link to gages. - distance is in meters. 
-usgs = st_as_sf(usgs,coords=c('dec_long_va', 'dec_lat_va'))
-st_crs(usgs) = 4326
-reaches = unique(lf_outputs$reach_id)
-
-nearest = st_nearest_feature(usgs,reach_geometries)
-distance = st_distance(usgs, reach_geometries[nearest,],by_element = TRUE)
-usgs$reach_id = reach_geometries$reach_id[nearest]
-usgs$distance = as.numeric(distance)
-
-# limit to usgs gages within 1km or whatever distance. 
-usgs_filt = usgs[usgs$distance<=5000,]
-
-# Remove gages with 'CREEK', etc. in the name. 
-smallName = grep('CREEK|Creek|creek|STREAM|Stream|stream|INLET|Inlet|inlet',usgs_filt$station_nm)
-usgs_filt=usgs_filt[-smallName,]
-usgs_sites = unique(usgs_filt$site_no)
+usgs_gages = fread('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\SWOT\\gage_sword_snapped.csv', colClasses = as.character('site_no'))
+usgs_gages = usgs_gages[usgs_gages$reach_id%in%lf_outputs$reach_id,]
 
 pull_gage = function(f){
   data = try(RivRetrieve::usa(site=f, variable='discharge'))
@@ -544,9 +588,10 @@ pull_gage = function(f){
   data=data[data$Date>=as.Date('2022-12-31'),]
   return(data)
 }
-gage_df_list = lapply(usgs_sites, pull_gage)
+
+gage_df_list = lapply(as.character(usgs_gages$site_no), pull_gage)
 gage_df = rbindlist(gage_df_list[!is.na(gage_df_list)])
-gage_df$reach_id = usgs_filt$reach_id[match(gage_df$gage, usgs_filt$site_no)]
+gage_df$reach_id = usgs_gages$reach_id[match(gage_df$gage, usgs_gages$site_no)]
 gage_df$reach_id=as.character(gage_df$reach_id)
 
 lf_outputs$Date = as.Date(lf_outputs$date)
@@ -556,25 +601,61 @@ validation = left_join(gage_df, lf_outputs,by=c('Date', 'reach_id'))
 
 s=ggplot(validation)+
   geom_point(aes(x=Q,y=q_lakeflow,color=reach_id))+
-  geom_point(aes(x=Q,y=exp(bayes_q)),col='black',size=0.5)+
+  #geom_point(aes(x=Q,y=exp(bayes_q)),col='black',size=0.5)+
+  geom_point(aes(x=Q,y=q_model), col='grey50')+
   geom_abline(aes(slope=1,intercept=0))+
-  facet_wrap(~gage)+
+  facet_wrap(~gage, scales='free')+
   scale_x_log10()+
   scale_y_log10()+
   theme_minimal()+
-  theme(legend.position = 'top')
+  theme(legend.position = 'none')
 s
 
 g=ggplot(validation)+
   geom_line(aes(x=Date, y=Q))+
   geom_point(aes(x=Date,y=q_lakeflow,col=reach_id))+
   #geom_point(aes(x=Date,y=exp(bayes_q)), col='black')+
-  geom_hline(aes(yintercept=q_model,col=reach_id))+
-  facet_wrap(~gage, scales='free_y')+
+  #geom_hline(aes(yintercept=q_model,col=reach_id))+
+  geom_point(aes(x=Date, y=q_model), col='grey50')+
+  facet_wrap(~gage, scales='free_y',ncol=1)+
   scale_y_log10()+
   theme_minimal()+
-  theme(legend.position = 'top')
+  theme(legend.position = 'none')
 g
+
+
+##Error metrics. 
+source('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\Error_stats\\src\\error_functions.R')
+validation = validation[!is.na(Q)&!is.na(q_lakeflow),]
+validation[,OBS:=.N,by=reach_id]
+validation[,meanQ:=mean(Q),by=reach_id]
+validation = validation[OBS>=5&!is.na(meanQ),]
+error_stats=data.table(validation)[,validate(q_lakeflow, Q),by=reach_id]
+print(error_stats)
+
+error_stats_model=data.table(validation)[,validate(q_model, Q),by=reach_id]
+print(error_stats_model)
+
+
+error_stats$type='LakeFlow'
+error_stats_model$type='Model'
+
+error_combined = bind_rows(error_stats, error_stats_model)
+error_combined$rBias = abs(error_combined$rBias)
+error_tall = melt(error_combined, id.vars=c('type', 'reach_id'))
+error_tall$meanQ =validation$meanQ[match(error_tall$reach_id, validation$reach_id)]
+
+ggplot(error_tall[variable%in%c('RRMSE','NRMSE','rBias'),])+
+  stat_ecdf(aes(x=value,color=type))+
+  facet_wrap(~variable, scales='free')+
+  coord_cartesian(xlim=c(0,300))
+
+ggplot(error_tall[variable%in%c('KGE','NSE', 'Rvalue'),])+
+  stat_ecdf(aes(x=value,color=type))+
+  facet_wrap(~variable)+
+  coord_cartesian(xlim=c(-1,1))
+
+error_tall$meanQ_cat = cut(error_tall$meanQ, c(-Inf, 50,100,200,400,Inf))
 
 #ggsave(paste0(inPath, 'figures/early_validation_v3.png'),g,bg='white', width=12,height=6,dpi=1000,units='in')
 #ggsave(paste0(inPath,'figures/early_validation_scatter_v3.png'),s,bg='white', width=12,height=6,dpi=1000,units='in')
@@ -622,8 +703,9 @@ val = bind_rows(val_inflow, val_outflow)
 in_out_plot = ggplot(val)+
   geom_line(aes(x=Date,y=Q))+
   geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  geom_hline(aes(yintercept=q_model),col='red')+
+  #geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
+  #geom_hline(aes(yintercept=q_model),col='red')+
+  #geom_point(aes(x=Date,y=q_model), col='blue')+
   scale_y_log10()+#(limits=c(1,1000))+
   ylab('Discharge (cms)')+
   xlab('')+
@@ -748,7 +830,8 @@ ggplot(val)+
   geom_line(aes(x=Date,y=Q))+
   geom_point(aes(x=Date, y=q_lakeflow), col='red')+
   #geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  geom_hline(aes(yintercept=q_model),col='red')+
+  #geom_hline(aes(yintercept=q_model),col='red')+
+  geom_point(aes(x=Date,y=q_model), col='black')+
   scale_y_log10()+#(limits=c(1,1000))+
   ylab('Discharge (cms)')+
   xlab('')+
