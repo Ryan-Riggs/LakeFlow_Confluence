@@ -1,7 +1,7 @@
 ##LakeFlow code for running locally
 ##By: Ryan Riggs and George Allen, June 2024.
 
-# *TODO: Fix the NRT pull for prior Q data of sword reaches using geoglows. 
+# *TODO: Update Geoglows pull to only access AWS once. Right now it's pulling tributary and prior seperately 
 ################################################################################
 # set Path to Lakeflow_local folder. 
 ################################################################################
@@ -36,7 +36,7 @@ swot_path = list.files('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/src/data_do
 
 open_and_filter = function(f){
   file = foreign::read.dbf(f)
-  file_sub = file[file$lake_id%in%gaged_lakes$lake_id,]
+  file_sub = file#[file$lake_id%in%gaged_lakes$lake_id,]
   return(file_sub)
 }
 
@@ -53,45 +53,114 @@ lakeData$lake_id = as.character(lakeData$lake_id)
 #FIXME remove lakedata with multiple ids, what's causing that??
 lakeData$lake_id_first = sub(";.*", "", lakeData$lake_id)
 lakeData$lake_id=lakeData$lake_id_first
+lakeData = lakeData[lakeData$lake_id%in%updated_pld$lake_id,]
 
+# # Limit to lakes where geoglows ran for easy comparison:
+# geoglows_lakes = list.files(paste0(inPath,'out/lf_results_geoglows'))
+# geoglows_lakes = gsub('.csv', '', geoglows_lakes)
+# lakeData = lakeData[lakeData$lake_id%in%geoglows_lakes,]
 ################################################################################
 # Function to pull SWOT reach data. 
 ################################################################################
 pull_data = function(feature_id){
-  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f')
+  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f,wse_r_u,slope_r_u,reach_q_b')
   response = GET(website)
   pull = content(response, as='parsed')$results
   data = read.csv(textConnection(pull$csv), sep=',')
   data$reach_id = feature_id
   return(data)
-}################################################################################
+}
+################################################################################
+# Tukey test for removing outliers. 
+################################################################################
+tukey_test = function(ts){
+  wseIQR = quantile(ts$wse, c(.25, .75))
+  wseT_l = wseIQR[1] - (diff(wseIQR)*1.5)
+  wseT_u = wseIQR[2] + (diff(wseIQR)*1.5)
+  
+  slopeIQR = quantile(ts$slope, c(.25, .75))
+  slopeT_l = slopeIQR[1] - (diff(slopeIQR)*1.5)
+  slopeT_u = slopeIQR[2] + (diff(slopeIQR)*1.5)
+  
+  widthIQR = quantile(ts$width, c(.25, .75))
+  widthT_l = widthIQR[1] - (diff(widthIQR)*1.5)
+  widthT_u = widthIQR[2] + (diff(widthIQR)*1.5)
+  
+  ts_filt = ts[ts$width>=widthT_l&ts$width<=widthT_u&ts$wse>=wseT_l&ts$wse<=wseT_u&ts$slope>=slopeT_l&ts$slope<=slopeT_u]
+  return(ts_filt)
+}
+################################################################################
 # Function to filter SWOT reach data. 
 ################################################################################
 filter_function = function(swot_ts){
-  dawg_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0,]
+  dawg_filter = tukey_test(swot_ts[swot_ts$time!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0,])
   qual_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$reach_q<=2,]
+  ssf_filter = tukey_test(swot_ts[swot_ts$time!='no_data'&swot_ts$reach_q_b<=32768&swot_ts$dark_frac<=0.1&swot_ts$wse_r_u<=0.5&swot_ts$slope_r_u<=10e-5&swot_ts$ice_clim_f==0&swot_ts$xovr_cal_q<=1,])
+
   #return(qual_filter)
-  return(dawg_filter)
+  return(dawg_filter[!is.na(dawg_filter$slope2)&!is.infinite(dawg_filter$slope2)&dawg_filter$slope2>0])
+  #return(ssf_filter)
 }
 ################################################################################
 # Function to pull tributary inflow Q estimates. 
 ################################################################################
-start_date = '20230101'
+start_date = '01-01-2023'
 
-download_tributary = function(reaches){
+download_tributary = function(reaches, start_date=start_date){
   source_python(paste0(inPath, 'src/geoglows_aws_pull.py'))
-  tributary_flow = pull_tributary(reach_id = reaches)
+  tributary_flow = pull_tributary(reach_id = reaches, start_date=start_date)
   tributary_flow$date = as.Date(row.names(tributary_flow))
   n_col = ncol(tributary_flow)
   tributary_aggregated = data.table(tributary_flow)[,tributary_total:=rowSums(.SD), .SDcols=-n_col]
   return(tributary_aggregated)
 }
+
+# if(use_ts_tributary==TRUE){
+# 
+# start_date = '01-01-2023'
+# 
+# download_tributary = function(reaches, start_date=start_date){
+#   source_python(paste0(inPath, 'src/geoglows_aws_pull.py'))
+#   tributary_flow = pull_tributary(reach_id = reaches, start_date=start_date)
+#   tributary_flow$date = as.Date(row.names(tributary_flow))
+#   #n_col = ncol(tributary_flow)
+#   #tributary_aggregated = data.table(tributary_flow)[,tributary_total:=rowSums(.SD), .SDcols=-n_col]
+#   #return(tributary_aggregated)
+#   return(tributary_flow)
+# }
+# 
+# tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries.csv'))
+# tributary_locations = tributary_locations[tributary_locations$lake_id%in%lakeData$lake_id,]
+# tributary = download_tributary(reaches=tributary_locations$LINKNO, start_date=start_date)
+# lks = unique(tributary_locations$lake_id)
+# tributary_list = list()
+# for(j in 1:length(lks)){
+#   reaches = tributary_locations$LINKNO[tributary_locations$lake_id==lks[j]]
+#   relevant_cols = which(colnames(tributary)%in%reaches)
+#   tributary_aggregated = data.table(tributary[,relevant_cols])[,tributary_total:=rowSums(.SD)]
+#   tributary_aggregated$date = tributary$date
+#   tributary_aggregated$lake_id = lks[j]
+#   tributary_list[[j]] = tributary_aggregated[,c('tributary_total', 'date', 'lake_id')]
+# }
+# names(tributary_list) = lks
+# }else{
+#   lks = unique(lakeData$lake_id)
+#   tributary_list = list()
+#   for(j in 1:length(lks)){
+#   tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries_merit.csv'))
+#   tributary_locations = tributary_locations[tributary_locations$lake_id==(lks[j]),]
+#   tributary_data = fread(paste0(inPath, 'in/ancillary/na_monthly_tributaries_grades.csv'))
+#   tributary_data = tributary_data[tributary_data$lake_id==lks[j],]
+#   tributary_list[[j]] = tributary_data
+#   }
+# names(tributary_list)=lks
+# }
 ################################################################################
 # Function to pull geoglows data for prior purposes
 ################################################################################
-pull_geoglows = function(reaches){
+pull_geoglows = function(reaches, start_date){
   source_python(paste0(inPath, 'src/geoglows_aws_pull.py'))
-  model_flow = pull_tributary(reach_id = reaches)
+  model_flow = pull_tributary(reach_id = reaches, start_date=start_date)
   model_flow$Date = as.Date(row.names(model_flow))
   return(data.table(model_flow))
 }
@@ -100,9 +169,11 @@ pull_geoglows = function(reaches){
 ################################################################################
 lakeFlow = function(lake){
   
-  # Use dynamic prior Q. 
+  # Use dynamic prior Q. False = SOS prior estimate from GRADES / MAF geoglows
   use_ts_prior=TRUE
   
+  # Use modeled daily tributary flows. False = mean monthly grades tributaries / MAF geoglows
+  use_ts_tributary=TRUE
   
   #Pull in SWOT river data and subset predownloaded SWOT lake data. 
   upID = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id==lake], ','))
@@ -121,8 +192,8 @@ lakeFlow = function(lake){
   lakeObs_all$time = as_datetime(lakeObs_all$time_str)
   
   # FIXME: changing SWOT widths to sword widths due to large errors. 
-  upObs_all$width=upObs_all$p_width
-  dnObs_all$width=dnObs_all$p_width
+  #upObs_all$width=upObs_all$p_width
+  #dnObs_all$width=dnObs_all$p_width
   
   
   # FIXME: changing lake areas to pld areas due to some weird errors. 
@@ -138,25 +209,25 @@ lakeFlow = function(lake){
   upObs_all$date = as.Date(upObs_all$time)
   dnObs_all$date = as.Date(dnObs_all$time)
   
-  lkDates = unique(lakeObs_all$date)
-  upDts = upObs_all[,.N,by=date][N>=length(upID)] # limit to dates with obs for each upstream reach.
-  dnDts = dnObs_all[,.N,by=date][N>=length(dnID)] # limit to dates with obs for each downstream reach. 
+  # FIXME: Aggregating lakes to mean values for multiple observations in one day. 
+  lakeObs = data.table(lakeObs_all)[,c('wse', 'area_total', 'date')][,lapply(.SD, mean), by=date]
+  upObs = data.table(upObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  dnObs = data.table(dnObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  
+  lkDates = unique(lakeObs$date)
+  upDts = upObs[,.N,by=date][N>=length(upID)] # limit to dates with obs for each upstream reach.
+  dnDts = dnObs[,.N,by=date][N>=length(dnID)] # limit to dates with obs for each downstream reach. 
   
   #goodDates = lkDates[lkDates%in%upObs_all$date&lkDates%in%dnObs_all$date]
   goodDates = lkDates[lkDates%in%upDts$date&lkDates%in%dnDts$date]
   
-  lakeObsGood = lakeObs_all[lakeObs_all$date%in%goodDates,]
-  upObsGood = upObs_all[upObs_all$date%in%goodDates,]
-  dnObsGood = dnObs_all[dnObs_all$date%in%goodDates,]
+  lakeObsGood = lakeObs[lakeObs$date%in%goodDates,]
+  upObsGood = upObs[upObs$date%in%goodDates,]
+  dnObsGood = dnObs[dnObs$date%in%goodDates,]
   
   lakeObs = lakeObsGood[order(lakeObsGood$date),]
   upObs = upObsGood[order(upObsGood$date),]
   dnObs = dnObsGood[order(dnObsGood$date),]
-  
-  # FIXME: Aggregating lakes to mean values for multiple observations in one day. 
-  lakeObs = data.table(lakeObs)[,c('wse', 'area_total', 'date')][,lapply(.SD, mean), by=date]
-  upObs = data.table(upObs)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
-  dnObs = data.table(dnObs)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
   
   upObs = upObs[order(upObs$reach_id),]
   dnObs = dnObs[order(dnObs$reach_id),]
@@ -213,7 +284,8 @@ lakeFlow = function(lake){
   # Used to assign ancillary data - not needed at the moment. 
   lakeObsOut$month = month(lakeObsOut$date_l)
   
-  # add in tributary data:
+  # add in tributary data:Either use geoglow (ts==TRUE or use GRADES-hydroDL mean monthly vals)
+  if(use_ts_tributary==TRUE){
   tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries.csv'))
   tributary_locations = tributary_locations[tributary_locations$lake_id==(lake),]
   if(nrow(tributary_locations)==0){
@@ -222,10 +294,29 @@ lakeFlow = function(lake){
   else{
   tributary_reaches = unique(tributary_locations$LINKNO[tributary_locations$lake_id==lake])
   tributary_reaches = as.list(tributary_reaches)
-  tributary_data = download_tributary(tributary_reaches)
+  tributary_data = download_tributary(tributary_reaches,'01-01-1940')
+  mean_annual = mean(tributary_data[,year:=lubridate::year(date)][,mean(tributary_total),year]$V1)
   lakeObsOut$tributary_total = tributary_data$tributary_total[match(lakeObsOut$date_l, tributary_data$date)]
   }
-  
+  }else{
+    # Removed GRADES monthly chunk and just using 
+    # tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries_merit.csv'))
+    # tributary_locations = tributary_locations[tributary_locations$lake_id==(lake),]
+    # tributary_data = fread(paste0(inPath, 'in/ancillary/na_monthly_tributaries_grades.csv'))
+    # tributary_data = tributary_data[tributary_data$lake_id==lake,]
+    # if(nrow(tributary_data)==0){lakeObsOut$tributary_total=0}
+    tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries.csv'))
+    tributary_locations = tributary_locations[tributary_locations$lake_id==(lake),]
+    if(nrow(tributary_locations)==0){
+      lakeObsOut$tributary_total=0
+    }else{
+    tributary_reaches = unique(tributary_locations$LINKNO[tributary_locations$lake_id==lake])
+    tributary_reaches = as.list(tributary_reaches)
+    tributary_data = download_tributary(tributary_reaches,'01-01-1940')
+    mean_annual = mean(tributary_data[,year:=lubridate::year(date)][,mean(tributary_total),year]$V1)
+    lakeObsOut$tributary_total = mean_annual
+  }
+}
   # add in et data: 
   et = fread(paste0(inPath, 'in/ancillary/et.csv'))
   et_lake = et[et$lake_id==lake,]
@@ -372,14 +463,14 @@ lakeFlow = function(lake){
   if(length(dn_sos_stan$reach_id_d)==0){return(NA)}
   
   
-  # Pull in Modeled timeseries as prior Q rather than mean. 
+  # Pull in Modeled timeseries as prior Q rather than mean: #Updating alternative to using static Geoglows mean annual flow. 
   if(use_ts_prior==TRUE){
     sword_geoglows = fread(paste0(inPath, '/in/ancillary/sword_geoglows.csv'))
     sword_reaches = c(upID, dnID)
     sword_geoglows_filt = sword_geoglows[sword_geoglows$reach_id%in%sword_reaches,c('reach_id','LINKNO')]
     geoglows_reaches = unique(as.list(sword_geoglows$LINKNO[sword_geoglows$reach_id%in%sword_reaches]))
     # Pull in modeled geoglows data. 
-    model_data = pull_geoglows(geoglows_reaches)
+    model_data = pull_geoglows(geoglows_reaches, '01-01-2023')
     # Convert bad Q to NA. 
     ind = ncol(model_data)-1
     model_data[,1:ind][model_data[,1:ind] < 0] <- 0
@@ -392,6 +483,49 @@ lakeFlow = function(lake){
     })
     model_data = model_data[model_data$Date%in%lakeObsOut$date_l,]
     model_wide = melt(model_data, id.vars=c('Date'))
+    model_wide$LINKNO = as.character(model_wide$variable)
+    model_wide$reach_id = sword_geoglows_filt$reach_id[match(model_wide$LINKNO, sword_geoglows_filt$LINKNO)]
+    model_list = split(model_wide, by='reach_id')
+    
+    up_ind = lapply(up_sos_stan$reach_id_u,function(x){which(as.character(x)==names(model_list))})
+    dn_ind = lapply(dn_sos_stan$reach_id_d,function(x){which(as.character(x)==names(model_list))})
+    
+    if(length(unique(model_wide$LINKNO))==1){
+      up_ind[[1]] = 1
+      dn_ind[[1]] = 1
+    }
+    
+    up_qhat = lapply(unlist(up_ind), function(x){t(as.matrix(model_list[[x]]$value))})
+    up_qhat = do.call(rbind, up_qhat)
+    
+    dn_qhat = lapply(unlist(dn_ind), function(x){t(as.matrix(model_list[[x]]$value))})
+    dn_qhat = do.call(rbind, dn_qhat)
+    
+    up_sos_stan$qHat_u = up_qhat
+    dn_sos_stan$qHat_d = dn_qhat
+  }else{
+    sword_geoglows = fread(paste0(inPath, '/in/ancillary/sword_geoglows.csv'))
+    sword_reaches = c(upID, dnID)
+    sword_geoglows_filt = sword_geoglows[sword_geoglows$reach_id%in%sword_reaches,c('reach_id','LINKNO')]
+    geoglows_reaches = unique(as.list(sword_geoglows$LINKNO[sword_geoglows$reach_id%in%sword_reaches]))
+    # Pull in modeled geoglows data. 
+    model_data = pull_geoglows(geoglows_reaches, '01-01-1940')
+    # Convert bad Q to NA. 
+    ind = ncol(model_data)-1
+    model_data[,1:ind][model_data[,1:ind] < 0] <- 0
+    # When model data is unavailable (NRT SWOT data), use mean model. 
+    missing_dates = data.table(Date=seq.Date((max(model_data$Date)+1), Sys.Date(), by=1))
+    model_data = bind_rows(model_data, missing_dates)
+    model_data[] <- lapply(model_data, function(x) { 
+      x[is.na(x)] <- mean(x, na.rm = TRUE)
+      x
+    })
+    #model_data = model_data[model_data$Date%in%lakeObsOut$date_l,]
+    model_annual = model_data[,year:=lubridate::year(Date),]
+    model_wide = melt(model_data, id.vars=c('year'))
+    model_wide = model_wide[,list(value=mean(value)),by=list(year, variable)][,list(value=mean(value)),by=variable][variable!='Date']
+    model_wide = model_wide[rep(model_wide[,.I], nrow(lakeObsOut))]
+    
     model_wide$LINKNO = as.character(model_wide$variable)
     model_wide$reach_id = sword_geoglows_filt$reach_id[match(model_wide$LINKNO, sword_geoglows_filt$LINKNO)]
     model_list = split(model_wide, by='reach_id')
@@ -534,7 +668,7 @@ lakeFlow = function(lake){
   outflow_outputs$bayes_q = bayes_outflow$`mean-all chains`
   
   output_df = bind_rows(inflow_outputs, outflow_outputs)
-  fwrite(output_df, paste0(inPath, '/out/lf_results/', lake, '.csv'))
+  fwrite(output_df, paste0(inPath, '/out/lf_results_na_new/', lake, '.csv'))
   return(output_df)
 }
 
@@ -542,7 +676,7 @@ lakeFlow = function(lake){
 # Filter to lakes with at least n observations. 
 n = 5
 lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
-lakes = lakes[lakes%in%gaged_lakes$lake_id]
+lakes = lakes#[lakes%in%gaged_lakes$lake_id]
 
 # Apply LakeFlow at the first three lakes. 
 #John Redmond '7420130653'
@@ -567,7 +701,7 @@ lf_outputs$lake_id=as.character(lf_outputs$lake_id)
 
 #rd = sample(length(lakes), 3)
 ryan = list()
-for(i in 119:length(lakes)){
+for(i in 1:length(lakes)){
   print(i)
   ryan[[i]] = lakeFlow(lakes[i])
 }
