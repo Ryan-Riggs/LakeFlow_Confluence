@@ -21,6 +21,7 @@ library(jsonlite)
 library(httr)
 library(BBmisc)
 library(reticulate)
+library(geoBAMr)
 ################################################################################
 # Read in relevant files: Harmonized sword-pld, reservoirs of interest, swot lake data
 ################################################################################
@@ -33,20 +34,18 @@ gaged_lakes = fread('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/lakeflow_lakes
 #swot_path = list.files(paste0(inPath, 'in/data_downloads/'), pattern='.dbf', full.names=TRUE)
 swot_path = list.files('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/src/data_downloads', pattern='.dbf', full.names=TRUE)
 
-
 open_and_filter = function(f){
   file = foreign::read.dbf(f)
-  file_sub = file#[file$lake_id%in%gaged_lakes$lake_id,]
+  file_sub = file[file$lake_id%in%gaged_lakes$lake_id,]
   return(file_sub)
 }
 
 files_filt = lapply(swot_path, open_and_filter)
 combined = data.table::rbindlist(files_filt)
 
-##Filter to non flagged lake obs.
-#lakeData = combined[combined$quality_f=='0'&combined$partial_f=='0',]
-# Filter to match DAWG filter. 
-lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2&combined$partial_f==0,]
+#Testing to see if partial flags make a difference since we're only using wse for lakes at the moment. 
+#lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2&combined$partial_f==0,]
+lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2,]
 lakeData = lakeData%>%distinct(.keep_all=TRUE)
 lakeData$lake_id = as.character(lakeData$lake_id)
 
@@ -55,10 +54,6 @@ lakeData$lake_id_first = sub(";.*", "", lakeData$lake_id)
 lakeData$lake_id=lakeData$lake_id_first
 lakeData = lakeData[lakeData$lake_id%in%updated_pld$lake_id,]
 
-# # Limit to lakes where geoglows ran for easy comparison:
-# geoglows_lakes = list.files(paste0(inPath,'out/lf_results_geoglows'))
-# geoglows_lakes = gsub('.csv', '', geoglows_lakes)
-# lakeData = lakeData[lakeData$lake_id%in%geoglows_lakes,]
 ################################################################################
 # Function to pull SWOT reach data. 
 ################################################################################
@@ -66,7 +61,8 @@ pull_data = function(feature_id){
   website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f,wse_r_u,slope_r_u,reach_q_b')
   response = GET(website)
   pull = content(response, as='parsed')$results
-  data = read.csv(textConnection(pull$csv), sep=',')
+  data = try(read.csv(textConnection(pull$csv), sep=','))
+  if(is.error(data)){return(NA)}
   data$reach_id = feature_id
   return(data)
 }
@@ -78,7 +74,7 @@ tukey_test = function(ts){
   wseT_l = wseIQR[1] - (diff(wseIQR)*1.5)
   wseT_u = wseIQR[2] + (diff(wseIQR)*1.5)
   
-  slopeIQR = quantile(ts$slope, c(.25, .75))
+  slopeIQR = quantile(ts$slope2, c(.25, .75))
   slopeT_l = slopeIQR[1] - (diff(slopeIQR)*1.5)
   slopeT_u = slopeIQR[2] + (diff(slopeIQR)*1.5)
   
@@ -86,21 +82,112 @@ tukey_test = function(ts){
   widthT_l = widthIQR[1] - (diff(widthIQR)*1.5)
   widthT_u = widthIQR[2] + (diff(widthIQR)*1.5)
   
-  ts_filt = ts[ts$width>=widthT_l&ts$width<=widthT_u&ts$wse>=wseT_l&ts$wse<=wseT_u&ts$slope>=slopeT_l&ts$slope<=slopeT_u]
+  ts_filt = ts[ts$width>=widthT_l&ts$width<=widthT_u&ts$wse>=wseT_l&ts$wse<=wseT_u&ts$slope2>=slopeT_l&ts$slope2<=slopeT_u,]
+  return(ts_filt)
+}
+
+tukey_test_lake = function(ts){
+  wseIQR = quantile(ts$wse, c(.25, .75))
+  wseT_l = wseIQR[1] - (diff(wseIQR)*1.5)
+  wseT_u = wseIQR[2] + (diff(wseIQR)*1.5)
+  
+  ts_filt = ts[ts$wse>=wseT_l&ts$wse<=wseT_u,]
   return(ts_filt)
 }
 ################################################################################
 # Function to filter SWOT reach data. 
 ################################################################################
 filter_function = function(swot_ts){
-  dawg_filter = tukey_test(swot_ts[swot_ts$time!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0,])
-  qual_filter = swot_ts[swot_ts$time!='no_data'&swot_ts$reach_q<=2,]
-  ssf_filter = tukey_test(swot_ts[swot_ts$time!='no_data'&swot_ts$reach_q_b<=32768&swot_ts$dark_frac<=0.1&swot_ts$wse_r_u<=0.5&swot_ts$slope_r_u<=10e-5&swot_ts$ice_clim_f==0&swot_ts$xovr_cal_q<=1,])
+  # Allowing partial obs to see if it degrades performances. 
+  dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
+  #dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
+  qual_filter = swot_ts[swot_ts$time_str!='no_data'&swot_ts$reach_q<=2,]
+  ssf_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$reach_q_b<=32768&swot_ts$dark_frac<=0.1&swot_ts$wse_r_u<=0.5&swot_ts$slope_r_u<=10e-5&swot_ts$ice_clim_f==0&swot_ts$xovr_cal_q<=1,])
 
   #return(qual_filter)
-  return(dawg_filter[!is.na(dawg_filter$slope2)&!is.infinite(dawg_filter$slope2)&dawg_filter$slope2>0])
+  return(dawg_filter)
   #return(ssf_filter)
 }
+################################################################################
+# Pull in relevant SWOT river reach data and filter using above functions. 
+################################################################################
+batch_download_SWOT <- function(obs_ids){
+  plan(multisession, workers = 6)
+  SWOT_data = future_lapply(unique(obs_ids),pull_data)
+  plan(sequential)
+  return(SWOT_data)
+}
+
+# Filter to lakes with at least n observations. 
+n = 5
+lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
+lakeFilt = lakeData[lake_id%in%lakes,tukey_test_lake(.SD),by=lake_id]
+lakes = unique(data.table(lakeFilt)[,.N,by=lake_id][N>=n]$lake_id)
+lakeFilt = lakeFilt[lake_id%in%lakes,]
+up_reaches = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id%in%lakes], ','))
+dn_reaches = unlist(strsplit(updated_pld$D_reach_id[updated_pld$lake_id%in%lakes], ','))
+reaches = c(up_reaches, dn_reaches)
+swot_river_pull = batch_download_SWOT(reaches)
+swot_river_filt = lapply(swot_river_pull[!is.na(swot_river_pull)], filter_function)
+swot_river = rbindlist(swot_river_filt)
+swot_river$time=as_datetime(swot_river$time_str)
+
+# Work on adding in the date filtering approach. This step will help improve the functions speed. 
+combining_lk_rv_obs = function(lake){
+  #Pull in SWOT river data and subset predownloaded SWOT lake data. 
+  upID = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id==lake], ','))
+  dnID = unlist(strsplit(updated_pld$D_reach_id[updated_pld$lake_id==lake], ','))
+  upObs_all = swot_river[swot_river$reach_id%in%upID,]
+  dnObs_all = swot_river[swot_river$reach_id%in%dnID,]
+  lakeObs_all = lakeFilt[lakeFilt$lake_id==lake,]
+  lakeObs_all$time = as_datetime(lakeObs_all$time_str)
+  
+  # FIXME: changing lake areas to pld areas due to some weird errors. 
+  prior_area = updated_pld$Lake_area[updated_pld$lake_id==lake]
+  lakeObs_all$area_total = prior_area
+  
+  if(nrow(lakeObs_all)<3){return(NA)}
+  
+  ################################################################################
+  # Get dates in proper format and subset to matching dates. 
+  ################################################################################
+  lakeObs_all$date = as.Date(lakeObs_all$time)
+  upObs_all$date = as.Date(upObs_all$time)
+  dnObs_all$date = as.Date(dnObs_all$time)
+  
+  # FIXME: Aggregating lakes to mean values for multiple observations in one day. 
+  lakeObs = data.table(lakeObs_all)[,c('wse', 'area_total', 'date')][,lapply(.SD, mean), by=date]
+  upObs = data.table(upObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  dnObs = data.table(dnObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  
+  lkDates = unique(lakeObs$date)
+  upDts = upObs[,.N,by=date][N>=length(upID)] # limit to dates with obs for each upstream reach.
+  dnDts = dnObs[,.N,by=date][N>=length(dnID)] # limit to dates with obs for each downstream reach. 
+  
+  #goodDates = lkDates[lkDates%in%upObs_all$date&lkDates%in%dnObs_all$date]
+  goodDates = lkDates[lkDates%in%upDts$date&lkDates%in%dnDts$date]
+  
+  lakeObsGood = lakeObs[lakeObs$date%in%goodDates,]
+  upObsGood = upObs[upObs$date%in%goodDates,]
+  dnObsGood = dnObs[dnObs$date%in%goodDates,]
+  
+  lakeObs = lakeObsGood[order(lakeObsGood$date),]
+  upObs = upObsGood[order(upObsGood$date),]
+  dnObs = dnObsGood[order(dnObsGood$date),]
+  
+  upObs = upObs[order(upObs$reach_id),]
+  dnObs = dnObs[order(dnObs$reach_id),]
+  
+  if(nrow(lakeObs)<3){return(NA)}
+  output = list(lakeObs, upObs, dnObs)
+  return(output)
+}
+
+viable_data = lapply(lakes, combining_lk_rv_obs)
+names(viable_data) = lakes
+n_obs_lake = data.table(lake=lakes,obs=unlist(lapply(viable_data, length)))
+viable_locations = n_obs_lake[obs>=3,]
+
 ################################################################################
 # Function to pull tributary inflow Q estimates. 
 ################################################################################
@@ -175,65 +262,75 @@ lakeFlow = function(lake){
   # Use modeled daily tributary flows. False = mean monthly grades tributaries / MAF geoglows
   use_ts_tributary=TRUE
   
-  #Pull in SWOT river data and subset predownloaded SWOT lake data. 
+  index=which(names(viable_data)==lake)
+  relevant_data = viable_data[index][[1]]
+  lakeObs = relevant_data[[1]]
+  upObs = relevant_data[[2]]
+  dnObs = relevant_data[[3]]
+  
   upID = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id==lake], ','))
   dnID = unlist(strsplit(updated_pld$D_reach_id[updated_pld$lake_id==lake], ','))
-  upObs_all = try(rbindlist(lapply(upID, pull_data)), silent=TRUE)
-  if(is.error(upObs_all)){return(NA)}
-  upObs_all = filter_function(upObs_all)
-  #upObs_all = upObs_all[upObs_all$time!='no_data'&upObs_all$reach_q<=2,]
-  upObs_all$time=as_datetime(upObs_all$time_str)
-  dnObs_all= try(rbindlist(lapply(dnID, pull_data)), silent=TRUE)
-  if(is.error(dnObs_all)){return(NA)}
-  #dnObs_all = dnObs_all[dnObs_all$time!='no_data'&dnObs_all$reach_q<=2,]
-  dnObs_all = filter_function(dnObs_all)
-  dnObs_all$time = as_datetime(dnObs_all$time_str)
-  lakeObs_all = lakeData[lakeData$lake_id==lake,]
-  lakeObs_all$time = as_datetime(lakeObs_all$time_str)
-  
-  # FIXME: changing SWOT widths to sword widths due to large errors. 
-  #upObs_all$width=upObs_all$p_width
-  #dnObs_all$width=dnObs_all$p_width
   
   
-  # FIXME: changing lake areas to pld areas due to some weird errors. 
-  prior_area = updated_pld$Lake_area[updated_pld$lake_id==lake]
-  lakeObs_all$area_total = prior_area
-  
-  if(nrow(lakeObs_all)<3){return(NA)}
-  
-  ################################################################################
-  # Get dates in proper format and subset to matching dates. 
-  ################################################################################
-  lakeObs_all$date = as.Date(lakeObs_all$time)
-  upObs_all$date = as.Date(upObs_all$time)
-  dnObs_all$date = as.Date(dnObs_all$time)
-  
-  # FIXME: Aggregating lakes to mean values for multiple observations in one day. 
-  lakeObs = data.table(lakeObs_all)[,c('wse', 'area_total', 'date')][,lapply(.SD, mean), by=date]
-  upObs = data.table(upObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
-  dnObs = data.table(dnObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
-  
-  lkDates = unique(lakeObs$date)
-  upDts = upObs[,.N,by=date][N>=length(upID)] # limit to dates with obs for each upstream reach.
-  dnDts = dnObs[,.N,by=date][N>=length(dnID)] # limit to dates with obs for each downstream reach. 
-  
-  #goodDates = lkDates[lkDates%in%upObs_all$date&lkDates%in%dnObs_all$date]
-  goodDates = lkDates[lkDates%in%upDts$date&lkDates%in%dnDts$date]
-  
-  lakeObsGood = lakeObs[lakeObs$date%in%goodDates,]
-  upObsGood = upObs[upObs$date%in%goodDates,]
-  dnObsGood = dnObs[dnObs$date%in%goodDates,]
-  
-  lakeObs = lakeObsGood[order(lakeObsGood$date),]
-  upObs = upObsGood[order(upObsGood$date),]
-  dnObs = dnObsGood[order(dnObsGood$date),]
-  
-  upObs = upObs[order(upObs$reach_id),]
-  dnObs = dnObs[order(dnObs$reach_id),]
-  
-  if(nrow(lakeObs)<3){return(NA)}
-  
+  # The below chunk is now ran above to speed things up. 
+  # #Pull in SWOT river data and subset predownloaded SWOT lake data. 
+  # upID = unlist(strsplit(updated_pld$U_reach_id[updated_pld$lake_id==lake], ','))
+  # dnID = unlist(strsplit(updated_pld$D_reach_id[updated_pld$lake_id==lake], ','))
+  # upObs_all = try(lapply(upID, pull_data), silent=TRUE)
+  # if(is.error(upObs_all)){return(NA)}
+  # upObs_all = rbindlist(lapply(upObs_all, filter_function))
+  # upObs_all$time=as_datetime(upObs_all$time_str)
+  # dnObs_all= try(lapply(dnID, pull_data), silent=TRUE)
+  # if(is.error(dnObs_all)){return(NA)}
+  # dnObs_all = rbindlist(lapply(dnObs_all, filter_function))
+  # dnObs_all$time = as_datetime(dnObs_all$time_str)
+  # lakeObs_all = lakeData[lakeData$lake_id==lake,]
+  # lakeObs_all$time = as_datetime(lakeObs_all$time_str)
+  # lakeObs_all = tukey_test_lake(lakeObs_all)
+  # 
+  # # FIXME: changing SWOT widths to sword widths due to large errors. 
+  # #upObs_all$width=upObs_all$p_width
+  # #dnObs_all$width=dnObs_all$p_width
+  # 
+  # 
+  # # FIXME: changing lake areas to pld areas due to some weird errors. 
+  # prior_area = updated_pld$Lake_area[updated_pld$lake_id==lake]
+  # lakeObs_all$area_total = prior_area
+  # 
+  # if(nrow(lakeObs_all)<3){return(NA)}
+  # 
+  # ################################################################################
+  # # Get dates in proper format and subset to matching dates. 
+  # ################################################################################
+  # lakeObs_all$date = as.Date(lakeObs_all$time)
+  # upObs_all$date = as.Date(upObs_all$time)
+  # dnObs_all$date = as.Date(dnObs_all$time)
+  # 
+  # # FIXME: Aggregating lakes to mean values for multiple observations in one day. 
+  # lakeObs = data.table(lakeObs_all)[,c('wse', 'area_total', 'date')][,lapply(.SD, mean), by=date]
+  # upObs = data.table(upObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  # dnObs = data.table(dnObs_all)[,c('wse', 'width', 'slope', 'slope2','reach_id', 'date')][,lapply(.SD, mean), by=list(date, reach_id)]
+  # 
+  # lkDates = unique(lakeObs$date)
+  # upDts = upObs[,.N,by=date][N>=length(upID)] # limit to dates with obs for each upstream reach.
+  # dnDts = dnObs[,.N,by=date][N>=length(dnID)] # limit to dates with obs for each downstream reach. 
+  # 
+  # #goodDates = lkDates[lkDates%in%upObs_all$date&lkDates%in%dnObs_all$date]
+  # goodDates = lkDates[lkDates%in%upDts$date&lkDates%in%dnDts$date]
+  # 
+  # lakeObsGood = lakeObs[lakeObs$date%in%goodDates,]
+  # upObsGood = upObs[upObs$date%in%goodDates,]
+  # dnObsGood = dnObs[dnObs$date%in%goodDates,]
+  # 
+  # lakeObs = lakeObsGood[order(lakeObsGood$date),]
+  # upObs = upObsGood[order(upObsGood$date),]
+  # dnObs = dnObsGood[order(dnObsGood$date),]
+  # 
+  # upObs = upObs[order(upObs$reach_id),]
+  # dnObs = dnObs[order(dnObs$reach_id),]
+  # 
+  # if(nrow(lakeObs)<3){return(NA)}
+  # 
   # FIXME: use upObs$d_x_area once it is released by JPL  
   d_x_area = function(wse, width){
     wse_from_min = wse - min(wse)
@@ -406,6 +503,35 @@ lakeFlow = function(lake){
     return(data.table(reach_id, geoA, geoN, geoNlower, geoNupper, geoAlower, geoAupper,
                       geoAsd, geoNsd, qHat, qUpper, qLower, sigma, qSd))
   }
+
+  # Create our own geobam priors when SoS provides null priors - common issue bc lake influenced reaches often don't pass SoS QAQC.
+  sos_fit = function(df){
+    reach_id = unique(unlist(df[grep('reach_id', names(df))]))#[[1]]
+    width_matrix = df[grep('width', names(df))][[1]]
+    slope_matrix = df[grep('slope2', names(df))][[1]]
+    geoA = estimate_logA0(width_matrix)
+    geoN = estimate_logn(slope_matrix, width_matrix)
+    geoNlower = estimate_lowerboundlogn(width_matrix)
+    geoNupper = estimate_upperboundlogn(width_matrix)
+    geoAlower = estimate_lowerboundA0(width_matrix)
+    geoAupper = estimate_upperboundA0(width_matrix)
+    geoAsd = estimate_A0SD(width_matrix)
+    geoNsd = estimate_lognSD(width_matrix)
+    #Talk to Craig about more informed estimates of the below. 
+    qHat = rep(NA, length(reach_id))
+    qLower = rep(NA, length(reach_id))
+    qUpper = rep(NA, length(reach_id))
+    qSd = rep(100, length(reach_id))
+    sigma = rep(0.25, length(reach_id))
+    #Assign a prior of 1000 cms is q prior is NA. - probably makes sense to use some relationship between width and meanQ in the future.   
+    qHat = ifelse(is.na(qHat), 1000, qHat)
+    qLower = ifelse(qLower<=0|is.na(qLower), 0.001, qLower)
+    qUpper = ifelse(is.na(qUpper),500000, qUpper)
+    return(list(data.table(reach_id, geoA, geoN, geoNlower, geoNupper, geoAlower, geoAupper,
+                      geoAsd, geoNsd, qHat, qUpper, qLower, sigma, qSd)))
+  }
+  
+  
   
   # Add u and d labels to each column of sos outputs - helps with organizing the data. 
   nms_paste = function(df, added_label){
@@ -417,11 +543,15 @@ lakeFlow = function(lake){
   
   # Pull priors from sos
   up_sos = lapply(upID, sos_pull)
-  if(any(unlist(lapply(up_sos, nrow))==0)){return(NA)}
+  if(any(unlist(lapply(up_sos, nrow))==0)){
+    up_sos = sos_fit(up_df_stan)
+  }
   up_sos = lapply(up_sos, nms_paste, 'u')
   
   dn_sos = lapply(dnID, sos_pull)
-  if(any(unlist(lapply(dn_sos, nrow))==0)){return(NA)}
+  if(any(unlist(lapply(dn_sos, nrow))==0)){
+    dn_sos = sos_fit(dn_df_stan)
+  }
   dn_sos = lapply(dn_sos, nms_paste, 'd')
   
   # Transpose the sos data to get in proper format for stan. 
@@ -470,7 +600,7 @@ lakeFlow = function(lake){
     sword_geoglows_filt = sword_geoglows[sword_geoglows$reach_id%in%sword_reaches,c('reach_id','LINKNO')]
     geoglows_reaches = unique(as.list(sword_geoglows$LINKNO[sword_geoglows$reach_id%in%sword_reaches]))
     # Pull in modeled geoglows data. 
-    model_data = pull_geoglows(geoglows_reaches, '01-01-2023')
+    model_data = pull_geoglows(geoglows_reaches, '01-01-1940')
     # Convert bad Q to NA. 
     ind = ncol(model_data)-1
     model_data[,1:ind][model_data[,1:ind] < 0] <- 0
@@ -481,6 +611,7 @@ lakeFlow = function(lake){
       x[is.na(x)] <- mean(x, na.rm = TRUE)
       x
     })
+    model_data_all = model_data
     model_data = model_data[model_data$Date%in%lakeObsOut$date_l,]
     model_wide = melt(model_data, id.vars=c('Date'))
     model_wide$LINKNO = as.character(model_wide$variable)
@@ -495,6 +626,10 @@ lakeFlow = function(lake){
       dn_ind[[1]] = 1
     }
     
+    if(length(up_ind[[1]])==0){
+      up_ind[[1]] = 2
+    }
+    
     up_qhat = lapply(unlist(up_ind), function(x){t(as.matrix(model_list[[x]]$value))})
     up_qhat = do.call(rbind, up_qhat)
     
@@ -503,6 +638,23 @@ lakeFlow = function(lake){
     
     up_sos_stan$qHat_u = up_qhat
     dn_sos_stan$qHat_d = dn_qhat
+    
+    # Replace upper and lower limit from SoS with Geoglows. 
+    model_upper_limit = apply(model_data_all, 2, max)
+    model_lower_limit = apply(model_data_all, 2, min)
+    model_limits = data.table(bind_rows(model_upper_limit, model_lower_limit))
+    model_limits$type=c('upper', 'lower')
+    model_limits = melt(model_limits,id.vars=c('type'))
+    model_limits = model_limits[model_limits$variable!='Date',]
+    model_limits$LINKNO = as.character(model_limits$variable)
+    model_limits$reach_id = sword_geoglows_filt$reach_id[match(model_limits$LINKNO, sword_geoglows_filt$LINKNO)]
+    model_limits$value = as.numeric(model_limits$value)
+    model_limits = split(model_limits, by='reach_id')
+  
+    up_sos_stan$qUpper_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
+    up_sos_stan$qLower_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
+    dn_sos_stan$qUpper_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
+    dn_sos_stan$qLower_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
   }else{
     sword_geoglows = fread(paste0(inPath, '/in/ancillary/sword_geoglows.csv'))
     sword_reaches = c(upID, dnID)
@@ -631,17 +783,27 @@ lakeFlow = function(lake){
   if(nrow(mn)==0|ncol(mn)<6){return(NA)}
   mn = mn[, c('type','mean-all chains')]
   
+  uncertainty = data.table(summary(fit)$summary)
+  uncertainty$type = mn$type
+  
   # Manning's n estimates from stan
   roughness_inflow = mn[startsWith(mn$type,'n[')]
+  roughness_inflow_sd = uncertainty[startsWith(uncertainty$type,'n[')]
   roughness_outflow = mn[startsWith(mn$type,'nOut[')]
+  roughness_outflow_sd = uncertainty[startsWith(uncertainty$type,'nOut[')]
   
   # A0 estimates from stan
   bath_inflow = mn[startsWith(mn$type,'a[')]
+  bath_inflow_sd = uncertainty[startsWith(uncertainty$type,'a[')]
   bath_outflow = mn[startsWith(mn$type,'aOut[')]
+  bath_outflow_sd = uncertainty[startsWith(uncertainty$type,'aOut[')]
+  
   
   # Bayesian estimate of inflow and outflow - not used for our purposes. 
   bayes_inflow = mn[startsWith(mn$type,'logQ_in[')]
+  bayes_inflow_sd = uncertainty[startsWith(uncertainty$type,'logQ_in[')]$sd
   bayes_outflow = mn[startsWith(mn$type,'logQ_out[')]
+  bayes_outflow_sd = uncertainty[startsWith(uncertainty$type,'logQ_out[')]$sd
   
   # Quick way to organize the data in case of varying N of inflows/outflows - could be placed in a function at some point. 
   inflow_outputs = list()
@@ -651,10 +813,11 @@ lakeFlow = function(lake){
     q_bayes = bayes_inflow$`mean-all chains`[bayes_inflow$type]
     inflow_outputs[[j]] = data.table(q_lakeflow = q_estimate, reach_id=upID[j], n_lakeflow=exp(roughness_inflow$`mean-all chains`[j]),a0_lakeflow=bath_inflow$`mean-all chains`[j],date=lakeObsOut$date_l,lake_id=lake,q_model=up_sos_stan$qHat_u[j,],
                                      width = stan_data$w[j,], slope2 = stan_data$s[j,], da = d_x_area_scaled_u[j,], wse = up_df_stan$wse_u[j,],
-                                     storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='inflow')
+                                     storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='inflow',n_lakeflow_sd = roughness_inflow_sd$sd[j],a0_lakeflow_sd =bath_inflow_sd$sd[j])
   }
   inflow_outputs = rbindlist(inflow_outputs)
   inflow_outputs$bayes_q = bayes_inflow$`mean-all chains`
+  inflow_outputs$bayes_q_sd = bayes_inflow_sd
   
   outflow_outputs = list()
   for(j in 1:length(dnID)){
@@ -662,21 +825,23 @@ lakeFlow = function(lake){
                       d_x_area_scaled_d[j,],dn_df_stan$width_d[j,], dn_df_stan$slope2_d[j,])
     outflow_outputs[[j]] = data.table(q_lakeflow = q_estimate, reach_id=dnID[j], n_lakeflow=exp(roughness_outflow$`mean-all chains`[j]),a0_lakeflow=bath_outflow$`mean-all chains`[j],date=lakeObsOut$date_l,lake_id=lake,q_model=dn_sos_stan$qHat_d[j,],
                                       width = stan_data$w2[j,], slope2 = stan_data$s2[j,], da = d_x_area_scaled_d[j,], wse = dn_df_stan$wse_d[j,],
-                                      storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='outflow')
+                                      storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='outflow',n_lakeflow_sd = roughness_outflow_sd$sd[j],a0_lakeflow_sd =bath_outflow_sd$sd[j])
   }
   outflow_outputs = rbindlist(outflow_outputs)
   outflow_outputs$bayes_q = bayes_outflow$`mean-all chains`
+  outflow_outputs$bayes_q_sd = bayes_outflow_sd
+  
+  
   
   output_df = bind_rows(inflow_outputs, outflow_outputs)
-  fwrite(output_df, paste0(inPath, '/out/lf_results_na_new/', lake, '.csv'))
+  fwrite(output_df, paste0(inPath, '/out/lf_results_partial/', lake, '.csv'))
   return(output_df)
 }
 
-
 # Filter to lakes with at least n observations. 
-n = 5
-lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
-lakes = lakes#[lakes%in%gaged_lakes$lake_id]
+# n = 5
+# lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
+# lakes = lakes#[lakes%in%gaged_lakes$lake_id]
 
 # Apply LakeFlow at the first three lakes. 
 #John Redmond '7420130653'
@@ -686,24 +851,12 @@ lakes = lakes#[lakes%in%gaged_lakes$lake_id]
 #Lake Chesdin '7310006793'
 #Allatoona: '7320350863'
 
-id_subset = '7420130653'
-index=which(lakes==id_subset)
-lf_results = lapply(lakes[index], lakeFlow)
-lf_outputs = rbindlist(lf_results[!is.na(lf_results)])
-
-lf_results = lapply(lakes[1:5], lakeFlow)
-output_files = list.files(paste0(inPath, '/out/lf_results/'), full.names=TRUE)
-lf_outputs = rbindlist(lapply(output_files, fread),fill=TRUE)
-lf_outputs$Date = as.Date(lf_outputs$Date)
-lf_outputs$reach_id = as.character(lf_outputs$reach_id)
-lf_outputs$lake_id=as.character(lf_outputs$lake_id)
-
 
 #rd = sample(length(lakes), 3)
 ryan = list()
-for(i in 1:length(lakes)){
+for(i in 1:nrow(viable_locations)){
   print(i)
-  ryan[[i]] = lakeFlow(lakes[i])
+  ryan[[i]] = lakeFlow(viable_locations$lake[i])
 }
 lf_outputs = rbindlist(ryan[!is.na(ryan)])
 lf_outputs = lf_outputs[!is.na(lf_outputs$q_lakeflow),]
