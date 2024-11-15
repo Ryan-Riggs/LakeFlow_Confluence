@@ -50,6 +50,7 @@ batch_download_SWOT_lakes <- function(obs_ids){
   return(SWOT_data)
 }
 
+#FIXME: Note that I limited it to the first 100 lakes - remove if you want to run across all of NA. 
 files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')][1:100])
 combined = rbindlist(files_filt[!is.na(files_filt)])
 ################################################################################
