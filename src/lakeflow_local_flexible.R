@@ -1,7 +1,6 @@
 ##LakeFlow code for running locally
 ##By: Ryan Riggs and George Allen, June 2024.
 
-# *TODO: Update Geoglows pull to only access AWS once. Right now it's pulling tributary and prior seperately 
 ################################################################################
 # set Path to Lakeflow_local folder. 
 ################################################################################
@@ -22,38 +21,51 @@ library(httr)
 library(BBmisc)
 library(reticulate)
 library(geoBAMr)
+library(future)
+library(future.apply)
+'%!in%' <- function(x,y)!('%in%'(x,y))
 ################################################################################
 # Read in relevant files: Harmonized sword-pld, reservoirs of interest, swot lake data
 ################################################################################
-updated_pld = fread(paste0(inPath,"in/SWORDv16_PLDv103.csv"))
+updated_pld = fread(paste0(inPath,"in/SWORDv16_PLDv103_wo_ghost_rch.csv"))
 updated_pld$lake_id =  as.character(updated_pld$lake_id)
-lakeData = fread(paste0(inPath, '/in/swot_lake_data.csv'))
-gaged_lakes = fread('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/lakeflow_lakes_w_usgs_gage.csv')
-
-# Below is for me so that I can easily add new swot observations to the folder. 
-#swot_path = list.files(paste0(inPath, 'in/data_downloads/'), pattern='.dbf', full.names=TRUE)
-swot_path = list.files('C:/Users/rriggs/OneDrive - DOI/Research/SWOT/src/data_downloads', pattern='.dbf', full.names=TRUE)
-
-open_and_filter = function(f){
-  file = foreign::read.dbf(f)
-  file_sub = file[file$lake_id%in%gaged_lakes$lake_id,]
-  return(file_sub)
+updated_pld$continent = substr(updated_pld$lake_id, 1,1)
+################################################################################
+# Read in lake data via hydrocron. 
+################################################################################
+pull_lake_data = function(feature_id){
+  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=PriorLake&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=lake_id,time_str,wse,area_total,xovr_cal_q,partial_f,dark_frac,ice_clim_f')
+  response = GET(website)
+  pull = content(response, as='parsed')$results
+  data = try(read.csv(textConnection(pull$csv), sep=','))
+  if(is.error(data)){return(NA)}
+  data$reach_id = feature_id
+  return(data)
 }
 
-files_filt = lapply(swot_path, open_and_filter)
-combined = data.table::rbindlist(files_filt)
+batch_download_SWOT_lakes <- function(obs_ids){
+  plan(multisession, workers = 20)
+  SWOT_data = future_lapply(unique(obs_ids),pull_lake_data)
+  plan(sequential)
+  return(SWOT_data)
+}
 
-#Testing to see if partial flags make a difference since we're only using wse for lakes at the moment. 
+files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')][1:100])
+combined = rbindlist(files_filt[!is.na(files_filt)])
+################################################################################
+# Filter lake data. 
+################################################################################
+#Testing to see if partial flags make a difference since we're only using wse for lakes at the moment. - partial wse seems great. 
 #lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2&combined$partial_f==0,]
-lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2,]
+lakeData = combined[combined$ice_clim_f<2&combined$dark_frac<=0.5&combined$xovr_cal_q<2&combined$time_str!='no_data'&combined$wse>(5000*-1),]
 lakeData = lakeData%>%distinct(.keep_all=TRUE)
 lakeData$lake_id = as.character(lakeData$lake_id)
 
-#FIXME remove lakedata with multiple ids, what's causing that??
+#Remove lakedata with multiple ids
 lakeData$lake_id_first = sub(";.*", "", lakeData$lake_id)
 lakeData$lake_id=lakeData$lake_id_first
 lakeData = lakeData[lakeData$lake_id%in%updated_pld$lake_id,]
-
+rm(combined)
 ################################################################################
 # Function to pull SWOT reach data. 
 ################################################################################
@@ -99,8 +111,8 @@ tukey_test_lake = function(ts){
 ################################################################################
 filter_function = function(swot_ts){
   # Allowing partial obs to see if it degrades performances. 
-  dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
-  #dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
+  #dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
+  dawg_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$ice_clim_f<2&swot_ts$dark_frac<=0.5&swot_ts$xovr_cal_q<2&swot_ts$partial_f==0&!is.na(swot_ts$slope2)&!is.infinite(swot_ts$slope2)&swot_ts$slope2>0&swot_ts$width>0,])
   qual_filter = swot_ts[swot_ts$time_str!='no_data'&swot_ts$reach_q<=2,]
   ssf_filter = tukey_test(swot_ts[swot_ts$time_str!='no_data'&swot_ts$reach_q_b<=32768&swot_ts$dark_frac<=0.1&swot_ts$wse_r_u<=0.5&swot_ts$slope_r_u<=10e-5&swot_ts$ice_clim_f==0&swot_ts$xovr_cal_q<=1,])
 
@@ -112,7 +124,7 @@ filter_function = function(swot_ts){
 # Pull in relevant SWOT river reach data and filter using above functions. 
 ################################################################################
 batch_download_SWOT <- function(obs_ids){
-  plan(multisession, workers = 6)
+  plan(multisession, workers = 20)
   SWOT_data = future_lapply(unique(obs_ids),pull_data)
   plan(sequential)
   return(SWOT_data)
@@ -142,7 +154,7 @@ combining_lk_rv_obs = function(lake){
   lakeObs_all = lakeFilt[lakeFilt$lake_id==lake,]
   lakeObs_all$time = as_datetime(lakeObs_all$time_str)
   
-  # FIXME: changing lake areas to pld areas due to some weird errors. 
+  # FIXME: changing lake areas to pld mean lake areas due to SWOT errors. 
   prior_area = updated_pld$Lake_area[updated_pld$lake_id==lake]
   lakeObs_all$area_total = prior_area
   
@@ -178,18 +190,18 @@ combining_lk_rv_obs = function(lake){
   upObs = upObs[order(upObs$reach_id),]
   dnObs = dnObs[order(dnObs$reach_id),]
   
-  if(nrow(lakeObs)<3){return(NA)}
+  if(nrow(lakeObs)<4){return(NA)}
   output = list(lakeObs, upObs, dnObs)
   return(output)
 }
 
+# subset to lakes with enough lake and river SWOT obs to run LakeFlow. 
 viable_data = lapply(lakes, combining_lk_rv_obs)
 names(viable_data) = lakes
 n_obs_lake = data.table(lake=lakes,obs=unlist(lapply(viable_data, length)))
-viable_locations = n_obs_lake[obs>=3,]
-
+viable_locations = n_obs_lake[obs>=3,] #Note this 3 is for ensuring an inflow, lake, and outlfow have viable data. 
 ################################################################################
-# Function to pull tributary inflow Q estimates. 
+# Function to pull tributary inflow Q estimates from Geoglows. 
 ################################################################################
 start_date = '01-01-2023'
 
@@ -201,47 +213,6 @@ download_tributary = function(reaches, start_date=start_date){
   tributary_aggregated = data.table(tributary_flow)[,tributary_total:=rowSums(.SD), .SDcols=-n_col]
   return(tributary_aggregated)
 }
-
-# if(use_ts_tributary==TRUE){
-# 
-# start_date = '01-01-2023'
-# 
-# download_tributary = function(reaches, start_date=start_date){
-#   source_python(paste0(inPath, 'src/geoglows_aws_pull.py'))
-#   tributary_flow = pull_tributary(reach_id = reaches, start_date=start_date)
-#   tributary_flow$date = as.Date(row.names(tributary_flow))
-#   #n_col = ncol(tributary_flow)
-#   #tributary_aggregated = data.table(tributary_flow)[,tributary_total:=rowSums(.SD), .SDcols=-n_col]
-#   #return(tributary_aggregated)
-#   return(tributary_flow)
-# }
-# 
-# tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries.csv'))
-# tributary_locations = tributary_locations[tributary_locations$lake_id%in%lakeData$lake_id,]
-# tributary = download_tributary(reaches=tributary_locations$LINKNO, start_date=start_date)
-# lks = unique(tributary_locations$lake_id)
-# tributary_list = list()
-# for(j in 1:length(lks)){
-#   reaches = tributary_locations$LINKNO[tributary_locations$lake_id==lks[j]]
-#   relevant_cols = which(colnames(tributary)%in%reaches)
-#   tributary_aggregated = data.table(tributary[,relevant_cols])[,tributary_total:=rowSums(.SD)]
-#   tributary_aggregated$date = tributary$date
-#   tributary_aggregated$lake_id = lks[j]
-#   tributary_list[[j]] = tributary_aggregated[,c('tributary_total', 'date', 'lake_id')]
-# }
-# names(tributary_list) = lks
-# }else{
-#   lks = unique(lakeData$lake_id)
-#   tributary_list = list()
-#   for(j in 1:length(lks)){
-#   tributary_locations = fread(paste0(inPath, 'in/ancillary/tributaries_merit.csv'))
-#   tributary_locations = tributary_locations[tributary_locations$lake_id==(lks[j]),]
-#   tributary_data = fread(paste0(inPath, 'in/ancillary/na_monthly_tributaries_grades.csv'))
-#   tributary_data = tributary_data[tributary_data$lake_id==lks[j],]
-#   tributary_list[[j]] = tributary_data
-#   }
-# names(tributary_list)=lks
-# }
 ################################################################################
 # Function to pull geoglows data for prior purposes
 ################################################################################
@@ -543,14 +514,17 @@ lakeFlow = function(lake){
   
   # Pull priors from sos
   up_sos = lapply(upID, sos_pull)
+  sos_geobam = 'sos'
   if(any(unlist(lapply(up_sos, nrow))==0)){
     up_sos = sos_fit(up_df_stan)
+    sos_geobam = 'geobam'
   }
   up_sos = lapply(up_sos, nms_paste, 'u')
   
   dn_sos = lapply(dnID, sos_pull)
   if(any(unlist(lapply(dn_sos, nrow))==0)){
     dn_sos = sos_fit(dn_df_stan)
+    sos_geobam = 'geobam'
   }
   dn_sos = lapply(dn_sos, nms_paste, 'd')
   
@@ -603,7 +577,7 @@ lakeFlow = function(lake){
     model_data = pull_geoglows(geoglows_reaches, '01-01-1940')
     # Convert bad Q to NA. 
     ind = ncol(model_data)-1
-    model_data[,1:ind][model_data[,1:ind] < 0] <- 0
+    model_data[,1:ind][model_data[,1:ind] < 0] <- 0.1
     # When model data is unavailable (NRT SWOT data), use mean model. 
     missing_dates = data.table(Date=seq.Date((max(model_data$Date)+1), Sys.Date(), by=1))
     model_data = bind_rows(model_data, missing_dates)
@@ -639,22 +613,22 @@ lakeFlow = function(lake){
     up_sos_stan$qHat_u = up_qhat
     dn_sos_stan$qHat_d = dn_qhat
     
-    # Replace upper and lower limit from SoS with Geoglows. 
-    model_upper_limit = apply(model_data_all, 2, max)
-    model_lower_limit = apply(model_data_all, 2, min)
-    model_limits = data.table(bind_rows(model_upper_limit, model_lower_limit))
-    model_limits$type=c('upper', 'lower')
-    model_limits = melt(model_limits,id.vars=c('type'))
-    model_limits = model_limits[model_limits$variable!='Date',]
-    model_limits$LINKNO = as.character(model_limits$variable)
-    model_limits$reach_id = sword_geoglows_filt$reach_id[match(model_limits$LINKNO, sword_geoglows_filt$LINKNO)]
-    model_limits$value = as.numeric(model_limits$value)
-    model_limits = split(model_limits, by='reach_id')
-  
-    up_sos_stan$qUpper_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
-    up_sos_stan$qLower_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
-    dn_sos_stan$qUpper_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
-    dn_sos_stan$qLower_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
+    # Replace upper and lower limit from SoS with Geoglows. Removed in case the geoglows estimate is wrong. LF can overcome bad prior but not bad low/up bounds.
+    # model_upper_limit = apply(model_data_all, 2, max)
+    # model_lower_limit = apply(model_data_all, 2, min)
+    # model_limits = data.table(bind_rows(model_upper_limit, model_lower_limit))
+    # model_limits$type=c('upper', 'lower')
+    # model_limits = melt(model_limits,id.vars=c('type'))
+    # model_limits = model_limits[model_limits$variable!='Date',]
+    # model_limits$LINKNO = as.character(model_limits$variable)
+    # model_limits$reach_id = sword_geoglows_filt$reach_id[match(model_limits$LINKNO, sword_geoglows_filt$LINKNO)]
+    # model_limits$value = as.numeric(model_limits$value)
+    # model_limits = split(model_limits, by='reach_id')
+    # 
+    # up_sos_stan$qUpper_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
+    # up_sos_stan$qLower_u=as.array(unlist(lapply(unlist(up_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
+    # dn_sos_stan$qUpper_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='upper']$value))})))
+    # dn_sos_stan$qLower_d=as.array(unlist(lapply(unlist(dn_ind), function(x){t(as.matrix(model_limits[[x]][type=='lower']$value))})))
   }else{
     sword_geoglows = fread(paste0(inPath, '/in/ancillary/sword_geoglows.csv'))
     sword_reaches = c(upID, dnID)
@@ -664,7 +638,7 @@ lakeFlow = function(lake){
     model_data = pull_geoglows(geoglows_reaches, '01-01-1940')
     # Convert bad Q to NA. 
     ind = ncol(model_data)-1
-    model_data[,1:ind][model_data[,1:ind] < 0] <- 0
+    model_data[,1:ind][model_data[,1:ind] < 0] <- 0.1
     # When model data is unavailable (NRT SWOT data), use mean model. 
     missing_dates = data.table(Date=seq.Date((max(model_data$Date)+1), Sys.Date(), by=1))
     model_data = bind_rows(model_data, missing_dates)
@@ -834,351 +808,22 @@ lakeFlow = function(lake){
   
   
   output_df = bind_rows(inflow_outputs, outflow_outputs)
-  fwrite(output_df, paste0(inPath, '/out/lf_results_partial/', lake, '.csv'))
+  output_df$prior_fit = sos_geobam
+  fwrite(output_df, paste0(inPath, '/out/lf_results_na_3/', lake, '.csv'))
   return(output_df)
 }
 
-# Filter to lakes with at least n observations. 
-# n = 5
-# lakes = unique(data.table(lakeData)[,.N,by=lake_id][N>=n]$lake_id)
-# lakes = lakes#[lakes%in%gaged_lakes$lake_id]
+#Ignore: This is just for subsetting to lakes that haven't run yet if the code breaks during a run. 
+# successful = list.files('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\LakeFlow_local\\out\\lf_results_na_3\\')
+# successful = gsub('.csv', '', successful)
+# missing = viable_locations[viable_locations$lake%!in%successful,]
+# viable_locations = missing
 
-# Apply LakeFlow at the first three lakes. 
-#John Redmond '7420130653'
-#Fontenelle '7720023433'
-#Flaming Gorge '7720025003'
-#Mohave '7720003433'
-#Lake Chesdin '7310006793'
-#Allatoona: '7320350863'
-
-
-#rd = sample(length(lakes), 3)
-ryan = list()
+#Apply the LakeFlow code. - Could also be done using lapply but I like to see it print where I'm at.
+output_list = list()
 for(i in 1:nrow(viable_locations)){
   print(i)
-  ryan[[i]] = lakeFlow(viable_locations$lake[i])
+  output_list[[i]] = lakeFlow(viable_locations$lake[i])
 }
-lf_outputs = rbindlist(ryan[!is.na(ryan)])
+lf_outputs = rbindlist(output_list[!is.na(output_list)])
 lf_outputs = lf_outputs[!is.na(lf_outputs$q_lakeflow),]
-
-#fwrite(lf_outputs,paste0(inPath, '/out/lf_results.csv'))
-################################################################################
-# Validate lakeflow observations with USGS data.  
-################################################################################
-usgs_gages = fread('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\SWOT\\gage_sword_snapped.csv', colClasses = as.character('site_no'))
-usgs_gages = usgs_gages[usgs_gages$reach_id%in%lf_outputs$reach_id,]
-
-pull_gage = function(f){
-  data = try(RivRetrieve::usa(site=f, variable='discharge'))
-  if(is.error(data)){return(NA)}
-  data$gage=f
-  data=data[data$Date>=as.Date('2022-12-31'),]
-  return(data)
-}
-
-gage_df_list = lapply(as.character(usgs_gages$site_no), pull_gage)
-gage_df = rbindlist(gage_df_list[!is.na(gage_df_list)])
-gage_df$reach_id = usgs_gages$reach_id[match(gage_df$gage, usgs_gages$site_no)]
-gage_df$reach_id=as.character(gage_df$reach_id)
-
-lf_outputs$Date = as.Date(lf_outputs$date)
-validation = left_join(gage_df, lf_outputs,by=c('Date', 'reach_id'))
-#fwrite(validation,paste0(inPath, 'out/gage_lf.csv'))
-
-
-s=ggplot(validation)+
-  geom_point(aes(x=Q,y=q_lakeflow,color=reach_id))+
-  #geom_point(aes(x=Q,y=exp(bayes_q)),col='black',size=0.5)+
-  geom_point(aes(x=Q,y=q_model), col='grey50')+
-  geom_abline(aes(slope=1,intercept=0))+
-  facet_wrap(~gage, scales='free')+
-  scale_x_log10()+
-  scale_y_log10()+
-  theme_minimal()+
-  theme(legend.position = 'none')
-s
-
-g=ggplot(validation)+
-  geom_line(aes(x=Date, y=Q))+
-  geom_point(aes(x=Date,y=q_lakeflow,col=reach_id))+
-  #geom_point(aes(x=Date,y=exp(bayes_q)), col='black')+
-  #geom_hline(aes(yintercept=q_model,col=reach_id))+
-  geom_point(aes(x=Date, y=q_model), col='grey50')+
-  facet_wrap(~gage, scales='free_y',ncol=1)+
-  scale_y_log10()+
-  theme_minimal()+
-  theme(legend.position = 'none')
-g
-
-
-##Error metrics. 
-source('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\Error_stats\\src\\error_functions.R')
-validation = validation[!is.na(Q)&!is.na(q_lakeflow),]
-validation[,OBS:=.N,by=reach_id]
-validation[,meanQ:=mean(Q),by=reach_id]
-validation = validation[OBS>=5&!is.na(meanQ),]
-error_stats=data.table(validation)[,validate(q_lakeflow, Q),by=reach_id]
-print(error_stats)
-
-error_stats_model=data.table(validation)[,validate(q_model, Q),by=reach_id]
-print(error_stats_model)
-
-
-error_stats$type='LakeFlow'
-error_stats_model$type='Model'
-
-error_combined = bind_rows(error_stats, error_stats_model)
-error_combined$rBias = abs(error_combined$rBias)
-error_tall = melt(error_combined, id.vars=c('type', 'reach_id'))
-error_tall$meanQ =validation$meanQ[match(error_tall$reach_id, validation$reach_id)]
-
-ggplot(error_tall[variable%in%c('RRMSE','NRMSE','rBias'),])+
-  stat_ecdf(aes(x=value,color=type))+
-  facet_wrap(~variable, scales='free')+
-  coord_cartesian(xlim=c(0,300))
-
-ggplot(error_tall[variable%in%c('KGE','NSE', 'Rvalue'),])+
-  stat_ecdf(aes(x=value,color=type))+
-  facet_wrap(~variable)+
-  coord_cartesian(xlim=c(-1,1))
-
-error_tall$meanQ_cat = cut(error_tall$meanQ, c(-Inf, 50,100,200,400,Inf))
-
-#ggsave(paste0(inPath, 'figures/early_validation_v3.png'),g,bg='white', width=12,height=6,dpi=1000,units='in')
-#ggsave(paste0(inPath,'figures/early_validation_scatter_v3.png'),s,bg='white', width=12,height=6,dpi=1000,units='in')
-
-gages_of_interest = c('07182510')
-voi = validation[validation$gage%in%gages_of_interest,]
-
-ggplot(voi[!is.na(q_lakeflow),])+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date,y=q_lakeflow),col='orange')+
-  geom_point(aes(x=Date,y=exp(bayes_q)), col='green')+
-  facet_wrap(~gage, scales='free')
-
-reach_data = pull_data('74244700461')
-reach_data = reach_data[reach_data$time!='no_data'&reach_data$reach_q<=2,]
-reach_data$Date = as_datetime(reach_data$time_str)
-reach_data$Date = as.Date(reach_data$Date)
-
-stage_data = RivRetrieve::usa('07182510', 'stage')
-stage_comp = merge(stage_data, reach_data, 'Date')
-stage_comp$diff_h = (stage_comp$H-min(stage_comp$H))/(max(stage_comp$H)-min(stage_comp$H))
-stage_comp$diff_swot = (stage_comp$wse-min(stage_comp$wse))/(max(stage_comp$wse)-min(stage_comp$wse))
-
-ggplot(stage_comp)+
-  geom_point(aes(x=diff_h, y= diff_swot))+
-  geom_abline(aes(intercept=0,slope=1))
-  
-
-
-##John redmond lake, KS
-lf_outputs$Date = as.Date(lf_outputs$date)
-gage = '07182390' #inflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '74244700461'
-val_inflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_inflow$type='Inflow'
-
-gage = '07182510' #outflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '74244700431'
-val_outflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_outflow$type='Outflow'
-val = bind_rows(val_inflow, val_outflow)
-
-in_out_plot = ggplot(val)+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  #geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  #geom_hline(aes(yintercept=q_model),col='red')+
-  #geom_point(aes(x=Date,y=q_model), col='blue')+
-  scale_y_log10()+#(limits=c(1,1000))+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type)
-in_out_plot
-
-ggsave(paste0(inPath, 'out/figures/John_Redmond_Lake_static_widths.png'),in_out_plot,bg='white', width=8,height=6,dpi=1000,units='in')
-
-##Error metrics. 
-source('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\Error_stats\\src\\error_functions.R')
-
-error_stats=data.table(val)[type=='Outflow',validate(q_lakeflow, Q),by=type]
-
-error_stats=data.table(val)[,validate(exp(bayes_q), Q),by=type]
-
-
-################################################################################
-##Fontenelle
-lf_outputs$Date = as.Date(lf_outputs$date)
-gage = '09209400' #inflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '77299000171'
-val_inflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_inflow$type='Inflow'
-
-gage = '09211200' #outflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '77299000131'
-val_outflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_outflow$type='Outflow'
-val = bind_rows(val_inflow, val_outflow)
-
-ggplot(val)+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  geom_hline(aes(yintercept=q_model),col='red')+
-  scale_y_log10()+#(limits=c(1,1000))+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')
-
-ggplot(val)+
-  geom_point(aes(x=Q, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Q, y= exp(bayes_q)), col='green')+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')+
-  geom_smooth(aes(x=Q,y=q_lakeflow), method=lm)
-
-#ggsave(paste0(inPath, 'out/figures/Fontenelle_static_widths.png'),in_out_plot,bg='white', width=8,height=6,dpi=1000,units='in')
-################################################################################
-##Allatoona
-lf_outputs$Date = as.Date(lf_outputs$date)
-gage = '02392000' #inflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '73289000241'
-val_inflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_inflow$type='Inflow'
-
-gage = '02394000' #outflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '73289000194'
-val_outflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_outflow$type='Outflow'
-val = bind_rows(val_inflow, val_outflow)
-
-ggplot(val)+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  geom_hline(aes(yintercept=q_model),col='red')+
-  scale_y_log10()+#(limits=c(1,1000))+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')
-
-ggplot(val)+
-  geom_point(aes(x=Q, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Q, y= exp(bayes_q)), col='green')+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')+
-  geom_smooth(aes(x=Q,y=q_lakeflow), method=lm)
-
-#ggsave(paste0(inPath, 'out/figures/Fontenelle_static_widths.png'),in_out_plot,bg='white', width=8,height=6,dpi=1000,units='in')
-
-
-################################################################################
-################################################################################
-##Chesdin
-lf_outputs$Date = as.Date(lf_outputs$date)
-gage = '02040892' #inflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '73190800051'
-val_inflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_inflow$type='Inflow'
-
-gage = '02041650' #outflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '73190800031'
-val_outflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2023-01-01'),], by=c('Date','reach_id'))
-val_outflow$type='Outflow'
-val = bind_rows(val_inflow, val_outflow)
-
-ggplot(val)+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  #geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  #geom_hline(aes(yintercept=q_model),col='red')+
-  geom_point(aes(x=Date,y=q_model), col='black')+
-  scale_y_log10()+#(limits=c(1,1000))+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')
-
-ggplot(val)+
-  geom_point(aes(x=Q, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Q, y= exp(bayes_q)), col='green')+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')+
-  geom_smooth(aes(x=Q,y=q_lakeflow), method=lm)
-
-#ggsave(paste0(inPath, 'out/figures/Fontenelle_static_widths.png'),in_out_plot,bg='white', width=8,height=6,dpi=1000,units='in')
-
-
-################################################################################
-################################################################################
-##Barnett Reservoir
-lf_outputs$Date = as.Date(lf_outputs$date)
-gage = '02483500' #inflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '74100600401'
-val_inflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2024-01-01'),], by=c('Date','reach_id'))
-val_inflow$type='Inflow'
-
-gage = '02485735' #outflow
-gageData=RivRetrieve::usa(gage, 'discharge')
-gageData$reach_id = '74100600341'
-val_outflow = right_join(lf_outputs, gageData[gageData$Date>as.Date('2024-01-01'),], by=c('Date','reach_id'))
-val_outflow$type='Outflow'
-val = bind_rows(val_inflow, val_outflow)
-
-ggplot(val)+
-  geom_line(aes(x=Date,y=Q))+
-  geom_point(aes(x=Date, y=q_lakeflow), col='red')+
-  #geom_point(aes(x=Date, y= exp(bayes_q)), col='green')+
-  geom_hline(aes(yintercept=q_model),col='red')+
-  scale_y_log10()+#(limits=c(1,1000))+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')
-
-ggplot(val)+
-  geom_point(aes(x=Q, y=q_lakeflow), col='red')+
-  geom_point(aes(x=Q, y= exp(bayes_q)), col='green')+
-  ylab('Discharge (cms)')+
-  xlab('')+
-  theme_minimal()+
-  theme(plot.title = element_text(hjust = 0.5), 
-        strip.text = element_text(size=14))+
-  facet_wrap(~type, scales='free')
-
-#ggsave(paste0(inPath, 'out/figures/Fontenelle_static_widths.png'),in_out_plot,bg='white', width=8,height=6,dpi=1000,units='in')
