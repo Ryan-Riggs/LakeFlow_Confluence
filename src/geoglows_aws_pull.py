@@ -5,6 +5,7 @@ import xarray
 import datetime
 
 # You may set anon to False if you have a credential file stored on your system but it is not necessary for this demonstration
+# dropna was added 10/18/2024
 
 def pull_tributary (reach_id, start_date):
     start_date = datetime.datetime.strptime(start_date, '%m-%d-%Y').date()
