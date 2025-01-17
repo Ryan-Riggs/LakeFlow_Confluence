@@ -34,7 +34,7 @@ updated_pld$continent = substr(updated_pld$lake_id, 1,1)
 # Read in lake data via hydrocron. 
 ################################################################################
 pull_lake_data = function(feature_id){
-  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=PriorLake&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=lake_id,time_str,wse,area_total,xovr_cal_q,partial_f,dark_frac,ice_clim_f')
+  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=PriorLake&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2025-12-31T00:00:00Z&output=csv&fields=lake_id,time_str,wse,area_total,xovr_cal_q,partial_f,dark_frac,ice_clim_f')
   response = GET(website)
   pull = content(response, as='parsed')$results
   data = try(read.csv(textConnection(pull$csv), sep=','))
@@ -50,8 +50,7 @@ batch_download_SWOT_lakes <- function(obs_ids){
   return(SWOT_data)
 }
 
-#FIXME: Note that I limited it to the first 100 lakes - remove if you want to run across all of NA. 
-files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')][1:100])
+files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')])
 combined = rbindlist(files_filt[!is.na(files_filt)])
 ################################################################################
 # Filter lake data. 
@@ -71,7 +70,7 @@ rm(combined)
 # Function to pull SWOT reach data. 
 ################################################################################
 pull_data = function(feature_id){
-  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2024-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f,wse_r_u,slope_r_u,reach_q_b')
+  website = paste0('https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries?feature=Reach&feature_id=',feature_id, '&start_time=2023-01-01T00:00:00Z&end_time=2025-12-31T00:00:00Z&output=csv&fields=reach_id,time_str,wse,width,slope,slope2,d_x_area,area_total,reach_q,p_width,xovr_cal_q,partial_f,dark_frac,ice_clim_f,wse_r_u,slope_r_u,reach_q_b')
   response = GET(website)
   pull = content(response, as='parsed')$results
   data = try(read.csv(textConnection(pull$csv), sep=','))
@@ -513,17 +512,18 @@ lakeFlow = function(lake){
     return(df)
   }
   
-  # Pull priors from sos
+  # Pull priors from sos 
+  #New 'any(is.na)...' is new to account for NA values in addition to zeros. 
   up_sos = lapply(upID, sos_pull)
   sos_geobam = 'sos'
-  if(any(unlist(lapply(up_sos, nrow))==0)){
+  if(any(unlist(lapply(up_sos, nrow))==0)|any(is.na(unlist(up_sos)))){
     up_sos = sos_fit(up_df_stan)
     sos_geobam = 'geobam'
   }
   up_sos = lapply(up_sos, nms_paste, 'u')
   
   dn_sos = lapply(dnID, sos_pull)
-  if(any(unlist(lapply(dn_sos, nrow))==0)){
+  if(any(unlist(lapply(dn_sos, nrow))==0)|any(is.na(unlist(dn_sos)))){
     dn_sos = sos_fit(dn_df_stan)
     sos_geobam = 'geobam'
   }
@@ -675,7 +675,9 @@ lakeFlow = function(lake){
     dn_sos_stan$qHat_d = dn_qhat
   }
   
-  
+  #New: Stan can't handle 0 prior estimates of discharge. So it replaces it with the mean value. 
+  up_sos_stan$qHat_u = ifelse(up_sos_stan$qHat_u<=0, mean(up_sos_stan$qHat_u), up_sos_stan$qHat_u)
+  dn_sos_stan$qHat_d = ifelse(dn_sos_stan$qHat_d<=0, mean(dn_sos_stan$qHat_d), dn_sos_stan$qHat_d)
   
   # Combine all data needed for stan. 
   stan_data = list(N = nrow(lakeObsOut),
@@ -788,7 +790,8 @@ lakeFlow = function(lake){
     q_bayes = bayes_inflow$`mean-all chains`[bayes_inflow$type]
     inflow_outputs[[j]] = data.table(q_lakeflow = q_estimate, reach_id=upID[j], n_lakeflow=exp(roughness_inflow$`mean-all chains`[j]),a0_lakeflow=bath_inflow$`mean-all chains`[j],date=lakeObsOut$date_l,lake_id=lake,q_model=up_sos_stan$qHat_u[j,],
                                      width = stan_data$w[j,], slope2 = stan_data$s[j,], da = d_x_area_scaled_u[j,], wse = up_df_stan$wse_u[j,],
-                                     storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='inflow',n_lakeflow_sd = roughness_inflow_sd$sd[j],a0_lakeflow_sd =bath_inflow_sd$sd[j])
+                                     storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='inflow',n_lakeflow_sd = roughness_inflow_sd$sd[j],a0_lakeflow_sd =bath_inflow_sd$sd[j],
+                                     q_upper = stan_data$qInupper[j],q_lower = stan_data$qInlower[j])
   }
   inflow_outputs = rbindlist(inflow_outputs)
   inflow_outputs$bayes_q = bayes_inflow$`mean-all chains`
@@ -800,7 +803,8 @@ lakeFlow = function(lake){
                       d_x_area_scaled_d[j,],dn_df_stan$width_d[j,], dn_df_stan$slope2_d[j,])
     outflow_outputs[[j]] = data.table(q_lakeflow = q_estimate, reach_id=dnID[j], n_lakeflow=exp(roughness_outflow$`mean-all chains`[j]),a0_lakeflow=bath_outflow$`mean-all chains`[j],date=lakeObsOut$date_l,lake_id=lake,q_model=dn_sos_stan$qHat_d[j,],
                                       width = stan_data$w2[j,], slope2 = stan_data$s2[j,], da = d_x_area_scaled_d[j,], wse = dn_df_stan$wse_d[j,],
-                                      storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='outflow',n_lakeflow_sd = roughness_outflow_sd$sd[j],a0_lakeflow_sd =bath_outflow_sd$sd[j])
+                                      storage=lakeObsOut$storage_l,dv=stan_data$dv_per, tributary=stan_data$lateral, et=stan_data$et,type='outflow',n_lakeflow_sd = roughness_outflow_sd$sd[j],a0_lakeflow_sd =bath_outflow_sd$sd[j],
+                                      q_upper = stan_data$qOutupper[j],q_lower = stan_data$qOutlower[j])
   }
   outflow_outputs = rbindlist(outflow_outputs)
   outflow_outputs$bayes_q = bayes_outflow$`mean-all chains`
@@ -810,15 +814,15 @@ lakeFlow = function(lake){
   
   output_df = bind_rows(inflow_outputs, outflow_outputs)
   output_df$prior_fit = sos_geobam
-  fwrite(output_df, paste0(inPath, '/out/lf_results_na_3/', lake, '.csv'))
+  fwrite(output_df, paste0(inPath, '/out/lf_results_na_4/', lake, '.csv'))
   return(output_df)
 }
 
 #Ignore: This is just for subsetting to lakes that haven't run yet if the code breaks during a run. 
-# successful = list.files('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\LakeFlow_local\\out\\lf_results_na_3\\')
-# successful = gsub('.csv', '', successful)
-# missing = viable_locations[viable_locations$lake%!in%successful,]
-# viable_locations = missing
+successful = list.files('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\LakeFlow_local\\out\\lf_results_na_4\\')
+successful = gsub('.csv', '', successful)
+missing = viable_locations[viable_locations$lake%!in%successful,]
+viable_locations = missing
 
 #Apply the LakeFlow code. - Could also be done using lapply but I like to see it print where I'm at.
 output_list = list()
