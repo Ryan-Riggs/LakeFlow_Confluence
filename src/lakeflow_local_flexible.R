@@ -50,7 +50,8 @@ batch_download_SWOT_lakes <- function(obs_ids){
   return(SWOT_data)
 }
 
-files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')])
+#FIX ME: Note that I limited it to the first 100 lakes as an example. 
+files_filt = batch_download_SWOT_lakes(updated_pld$lake_id[updated_pld$continent%in%c('7', '8')])[1:100]
 combined = rbindlist(files_filt[!is.na(files_filt)])
 ################################################################################
 # Filter lake data. 
@@ -819,10 +820,10 @@ lakeFlow = function(lake){
 }
 
 #Ignore: This is just for subsetting to lakes that haven't run yet if the code breaks during a run. 
-successful = list.files('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\LakeFlow_local\\out\\lf_results_na_4\\')
-successful = gsub('.csv', '', successful)
-missing = viable_locations[viable_locations$lake%!in%successful,]
-viable_locations = missing
+#successful = list.files('C:\\Users\\rriggs\\OneDrive - DOI\\Research\\LakeFlow_local\\out\\lf_results_na_4\\')
+#successful = gsub('.csv', '', successful)
+#missing = viable_locations[viable_locations$lake%!in%successful,]
+#viable_locations = missing
 
 #Apply the LakeFlow code. - Could also be done using lapply but I like to see it print where I'm at.
 output_list = list()
